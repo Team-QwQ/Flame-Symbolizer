@@ -347,7 +347,7 @@ process_stack_line() {
   fi
 
   local stack_part count
-  if [[ "$line" =~ ^(.*\S)[[:space:]]+([0-9]+)$ ]]; then
+  if [[ "$line" =~ ^(.+[^[:space:]])[[:space:]]+([0-9]+)$ ]]; then
     stack_part="${BASH_REMATCH[1]}"
     count="${BASH_REMATCH[2]}"
   else
