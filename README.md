@@ -13,13 +13,21 @@
 ./scripts/resolve-stacks.sh \
 	--maps /tmp/sample.maps \
 	--symbol-dir /opt/sysroot \
-	--addr2line aarch64-linux-gnu-addr2line \
+	--toolchain-prefix aarch64-linux-gnu- \
 	--addr2line-flags "-f -C" \
+	--location-format short \
 	--input collapsed.txt \
 	--output collapsed.resolved.txt
 ```
 
 默认读取 stdin / 写入 stdout，可级联进/出管道（如 `... | resolve-stacks.sh --maps ... | flamegraph.pl > flame.svg`）。
+
+### 选项要点
+- `--toolchain-prefix`：交叉工具链前缀（如 `aarch64-linux-gnu-`），用于调用 `addr2line`、`readelf` 等；如需自定义 `addr2line` 路径，可再用 `--addr2line` 覆盖。
+- `--location-format`：符号输出格式；`short`（默认）仅保留文件名与行号，`full` 保留路径，`none` 去掉 file:line。
+- `--debug`：打印段表、符号目录命中与地址调整决策到 stderr；stdout 不变。
+- ELF 类型自动识别：`ET_EXEC` 直接用运行时地址，`ET_DYN`（PIE/DSO）使用基址调整；无法识别时退化为相对地址。
+- 符号缺失告警：找不到模块二进制或符号表缺失时告警一次并缓存，避免刷屏，后续地址保持原样。
 
 ## 开发验证
 
