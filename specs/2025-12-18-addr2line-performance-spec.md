@@ -57,5 +57,6 @@
 - 大目录下的 `find` 仍可能昂贵；可能需要预先索引或限制搜索深度。
 
 ## 相关参考
-- 主规格：[specs/addr2line-symbolizer.md](addr2line-symbolizer.md)
+- 主规格：[specs/2025-12-17-addr2line-spec.md](2025-12-17-addr2line-spec.md)
 - 现有计划：[plans/2025-12-17-addr2line-plan.md](../plans/2025-12-17-addr2line-plan.md)
+- 性能计划：[plans/2025-12-18-addr2line-performance-plan.md](../plans/2025-12-18-addr2line-performance-plan.md)

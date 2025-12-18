@@ -2,7 +2,7 @@
 
 ## 范围与参考
 - 目标：实现一套可多次执行的 shell 脚本，依据 maps + 符号目录将 stackcollapse 输出中的地址替换为函数名，包含 ELF 类型自动识别、输出格式开关与调试/告警策略。
-- 规范：依据 [specs/addr2line-symbolizer.md](specs/addr2line-symbolizer.md)，性能优先，当前版本仅支持文件输入/输出，不支持 stdin/stdout 流式。
+- 规范：依据 [specs/2025-12-17-addr2line-spec.md](specs/2025-12-17-addr2line-spec.md)，性能优先，当前版本仅支持文件输入/输出，不支持 stdin/stdout 流式。
 
 ## 假设与不在范围内
 - 假设：
@@ -56,4 +56,4 @@
 - 错误路径：刻意缺失符号目录或去除符号表，确保输出警告但不中断，且同段仅告警一次。
 
 ## 审批状态
-- 当前处于 `/do` 阶段，按本计划实施。
+- `/do` 阶段实施完成，等待验证/验收。

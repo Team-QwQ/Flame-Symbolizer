@@ -3,8 +3,8 @@
 ## 范围与依据
 - 范围：在不改变 CLI/输出语义的前提下，解决大规模输入的性能与阻塞问题，默认启用地址级批处理，并确保流式、行序输出与可观测性。
 - 规范：
-  - [specs/addr2line-performance.md](../specs/addr2line-performance.md)
-  - [specs/addr2line-symbolizer.md](../specs/addr2line-symbolizer.md)
+   - [specs/2025-12-18-addr2line-performance-spec.md](../specs/2025-12-18-addr2line-performance-spec.md)
+   - [specs/2025-12-17-addr2line-spec.md](../specs/2025-12-17-addr2line-spec.md)
 
 ## 假设与不在范围
 - 输入为标准 stackcollapse 文本；maps 与符号目录能匹配真实模块路径或文件名。
