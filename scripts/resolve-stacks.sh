@@ -6,12 +6,12 @@ print_help() {
 Usage: resolve-stacks.sh [options]
 
 Required:
+  --input FILE               Input file (stackcollapse format). Stdin is not supported.
+  --output FILE              Output file path. Stdout is not supported.
   --maps PATH                 Path to /proc/<pid>/maps style file used to recover load addresses.
 
 Optional:
   --symbol-dir DIR            Directory containing symbolized binaries; may be repeated, supports glob/relative paths.
-  --input FILE                Input file (stackcollapse format). Defaults to stdin when omitted or set to '-'.
-  --output FILE               Output file. Defaults to stdout when omitted or set to '-'.
   --toolchain-prefix STR      Prefix for cross toolchain (e.g. aarch64-linux-gnu-); applied to readelf/addr2line.
   --addr2line PATH            addr2line binary to invoke (default: value of $ADDR2LINE or 'addr2line').
   --addr2line-flags STRING    Extra flags passed verbatim to addr2line (e.g. "-f -C").
@@ -57,8 +57,8 @@ debug_log() {
 
 MAPS_FILE=""
 SYMBOL_DIRS=()
-INPUT_PATH="-"
-OUTPUT_PATH="-"
+INPUT_PATH=""
+OUTPUT_PATH=""
 ADDR2LINE_BIN="${ADDR2LINE:-addr2line}"
 ADDR2LINE_FLAGS=""
 TOOLCHAIN_PREFIX=""
@@ -764,23 +764,26 @@ fi
 [[ -n "$MAPS_FILE" ]] || abort "--maps is required"
 [[ -r "$MAPS_FILE" ]] || abort "Cannot read maps file: $MAPS_FILE"
 
-if [[ "$INPUT_PATH" != "-" && ! -r "$INPUT_PATH" ]]; then
-  abort "Cannot read input file: $INPUT_PATH"
+[[ -n "$INPUT_PATH" ]] || abort "--input is required"
+if [[ "$INPUT_PATH" == "-" ]]; then
+  abort "Stdin is not supported; provide --input FILE"
+fi
+[[ -r "$INPUT_PATH" ]] || abort "Cannot read input file: $INPUT_PATH"
+
+[[ -n "$OUTPUT_PATH" ]] || abort "--output is required"
+if [[ "$OUTPUT_PATH" == "-" ]]; then
+  abort "Stdout is not supported; provide --output FILE"
 fi
 
-if [[ "$OUTPUT_PATH" != "-" ]]; then
-  OUTPUT_DIR=$(dirname "$OUTPUT_PATH")
-  if [[ ! -d "$OUTPUT_DIR" ]]; then
-    abort "Output directory does not exist: $OUTPUT_DIR"
-  fi
+OUTPUT_DIR=$(dirname "$OUTPUT_PATH")
+if [[ ! -d "$OUTPUT_DIR" ]]; then
+  abort "Output directory does not exist: $OUTPUT_DIR"
 fi
 
-if [[ "$INPUT_PATH" != "-" && "$OUTPUT_PATH" != "-" ]]; then
-  abs_in=$(cd "$(dirname "$INPUT_PATH")" && pwd -P)/"$(basename "$INPUT_PATH")"
-  abs_out=$(cd "$(dirname "$OUTPUT_PATH")" && pwd -P)/"$(basename "$OUTPUT_PATH")"
-  if [[ "$abs_in" == "$abs_out" ]]; then
-    abort "Input and output paths are identical; use distinct files to avoid overwrite"
-  fi
+abs_in=$(cd "$(dirname "$INPUT_PATH")" && pwd -P)/"$(basename "$INPUT_PATH")"
+abs_out=$(cd "$(dirname "$OUTPUT_PATH")" && pwd -P)/"$(basename "$OUTPUT_PATH")"
+if [[ "$abs_in" == "$abs_out" ]]; then
+  abort "Input and output paths are identical; use distinct files to avoid overwrite"
 fi
 
 if ! command -v "$ADDR2LINE_BIN" >/dev/null 2>&1; then
@@ -802,18 +805,7 @@ run_symbolization() {
   resolve_symbol_dirs
   load_maps
 
-  local input_source
-  if [[ "$INPUT_PATH" == "-" ]]; then
-    input_source="/dev/stdin"
-  else
-    input_source="$INPUT_PATH"
-  fi
-
-  if [[ "$OUTPUT_PATH" == "-" ]]; then
-    process_stream <"$input_source"
-  else
-    process_stream <"$input_source" >"$OUTPUT_PATH"
-  fi
+  process_stream <"$INPUT_PATH" >"$OUTPUT_PATH"
 
   if [[ $DEBUG_MODE -eq 1 ]]; then
     debug_log "summary lines=$LINES_PROCESSED batches=$BATCH_CALLS modules_hit=$MODULE_RESOLVE_HITS modules_miss=$MODULE_RESOLVE_MISS addr2line_skipped=$ADDR2LINE_SKIPPED"

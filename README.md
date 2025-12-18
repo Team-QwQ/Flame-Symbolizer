@@ -19,15 +19,14 @@
 	--input collapsed.txt \
 	--output collapsed.resolved.txt
 ```
-
-默认读取 stdin / 写入 stdout，可级联进/出管道（如 `... | resolve-stacks.sh --maps ... | flamegraph.pl > flame.svg`）。
+输入与输出必须是文件路径，不支持 stdin/stdout 管道模式。
 
 ### 选项要点
 - `--toolchain-prefix`：交叉工具链前缀（如 `aarch64-linux-gnu-`），用于调用 `addr2line`、`readelf` 等；如需自定义 `addr2line` 路径，可再用 `--addr2line` 覆盖。
 - `--location-format`：符号输出格式；`short`（默认）仅保留文件名与行号，`full` 保留路径，`none` 去掉 file:line。
-- `--debug`：打印段表、符号目录命中与地址调整决策到 stderr；stdout 不变。
+- `--debug`：打印段表、符号目录命中与地址调整决策到 stderr；输出文件不变。
 - ELF 类型自动识别：`ET_EXEC` 直接用运行时地址，`ET_DYN`（PIE/DSO）使用基址调整；无法识别时退化为相对地址。
-- 符号缺失告警：找不到模块二进制或符号表缺失时告警一次并缓存，避免刷屏，后续地址保持原样。
+- 符号缺失告警：找不到模块二进制时对同一模块仅告警一次；符号缺失/`??` 时允许多次告警，但后续地址仍会继续尝试解析。
 - 默认按二进制聚合地址批量调用 `addr2line`，降低子进程开销，同时保持行序与逐行流式输出。
 
 ## 开发验证

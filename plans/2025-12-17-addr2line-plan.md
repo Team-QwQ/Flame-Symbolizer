@@ -2,7 +2,7 @@
 
 ## 范围与参考
 - 目标：实现一套可多次执行的 shell 脚本，依据 maps + 符号目录将 stackcollapse 输出中的地址替换为函数名，包含 ELF 类型自动识别、输出格式开关与调试/告警策略。
-- 规范：依据 [specs/addr2line-symbolizer.md](specs/addr2line-symbolizer.md)。
+- 规范：依据 [specs/addr2line-symbolizer.md](specs/addr2line-symbolizer.md)，性能优先，当前版本仅支持文件输入/输出，不支持 stdin/stdout 流式。
 
 ## 假设与不在范围内
 - 假设：
@@ -15,8 +15,8 @@
 
 ## 实施阶段与步骤
 1. **脚本骨架与参数解析**
-   - 扩展 `scripts/resolve-stacks.sh` 参数：必选 `--maps`，可选多次 `--symbol-dir`，`--toolchain-prefix`（调用 `addr2line`/`readelf` 等前缀），`--addr2line` 覆盖，`--addr2line-flags` 透传，`--input`/`--output`（默认 stdin/stdout），`--location-format`（none|short|full，默认 short），`--debug`。
-   - 完善帮助与错误码，缺失必需参数或不可读文件时立即退出。
+   - 扩展 `scripts/resolve-stacks.sh` 参数：必选 `--maps`，可选多次 `--symbol-dir`，`--toolchain-prefix`（调用 `addr2line`/`readelf` 等前缀），`--addr2line` 覆盖，`--addr2line-flags` 透传，`--input`/`--output`（均为文件路径，不支持 stdin/stdout），`--location-format`（none|short|full，默认 short），`--debug`。
+   - 完善帮助与错误码，缺失必需参数、输入不可读、输出目录不存在、输入输出路径相同等场景立即退出。
 
 2. **基础管线实现**
    - 逐行解析 stackcollapse 行，分割帧与计数，识别 `0x` 地址帧。
@@ -36,7 +36,7 @@
    - 解析结果按所选输出格式渲染并缓存。
 
 5. **调试与可见性**
-   - `--debug` 模式下输出段表、符号目录命中、地址调整决策到 stderr；stdout 不受影响。
+   - `--debug` 模式下输出段表、符号目录命中、地址调整决策到 stderr；输出文件不受影响。
    - 默认模式下：缺失二进制警告一次/模块；符号缺失/`??` 可多次警告，但后续地址仍会尝试解析。
 
 6. **校验与文档**
@@ -56,4 +56,4 @@
 - 错误路径：刻意缺失符号目录或去除符号表，确保输出警告但不中断，且同段仅告警一次。
 
 ## 审批状态
-- 当前处于 `/plan` 阶段，等待确认上述更新后的计划后进入 `/do` 实施。
+- 当前处于 `/do` 阶段，按本计划实施。
