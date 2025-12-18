@@ -32,10 +32,20 @@ warn() {
 
 warn_once() {
   local key="$1" msg="$2"
-  if [[ -n "${WARNED_ONCE[$key]:-}" ]]; then
+  local pre_seen_mem="${WARNED_ONCE[$key]:-}"
+  local pre_seen_file=0
+  if [[ -f "$WARN_ONCE_FILE" ]]; then
+    if grep -Fxq "$key" "$WARN_ONCE_FILE" 2>/dev/null; then
+      pre_seen_file=1
+    fi
+  fi
+
+  if [[ -n "$pre_seen_mem" || $pre_seen_file -eq 1 ]]; then
     return
   fi
+
   WARNED_ONCE["$key"]=1
+  printf '%s\n' "$key" >>"$WARN_ONCE_FILE"
   warn "$msg"
 }
 
@@ -60,6 +70,7 @@ ADDR2LINE_OVERRIDDEN=0
 READ_ELF_AVAILABLE=1
 
 declare -A ADDRESS_CACHE=()
+declare -A ADDRESS_RELHEX=()  # token -> relative hex for addr2line
 declare -a MAP_STARTS=()    # segment starts (decimal)
 declare -a MAP_ENDS=()      # segment ends (decimal)
 declare -a MAP_OFFSETS=()   # file offsets
@@ -74,6 +85,10 @@ declare -A ADDRESS_MODULE=()    # token -> module path
 declare -A MODULE_TYPES=()      # binary path -> ELF type
 declare -A MODULE_BLOCKED=()    # module path -> blocked (missing symbols)
 declare -A WARNED_ONCE=()       # dedupe warnings per key
+WARN_ONCE_FILE=""
+
+LINES_PROCESSED=0
+BATCH_CALLS=0
 
 SYMBOL_SEARCH_AVAILABLE=0
 readonly MISSING_BINARY_SENTINEL="__MISSING_BINARY__"
@@ -222,7 +237,25 @@ locate_binary_for_module() {
   fi
 
   local sanitized="${module_path#/}"
-  local dir candidate basename
+  local module_basename="${module_path##*/}"
+  if [[ -z "$module_basename" ]]; then
+    module_basename="$sanitized"
+  fi
+
+  local dir candidate
+
+  # 1) 根平铺：目录根直接按文件名查找
+  for dir in "${RESOLVED_SYMBOL_DIRS[@]}"; do
+    candidate="${dir%/}/${module_basename}"
+    if [[ -f "$candidate" ]]; then
+      BINARY_CACHE["$module_path"]="$candidate"
+      debug_log "module $module_path resolved to $candidate via root-flat"
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+
+  # 2) sysroot 拼接：使用 maps 原始绝对路径
   for dir in "${RESOLVED_SYMBOL_DIRS[@]}"; do
     candidate="${dir%/}/${sanitized}"
     if [[ -f "$candidate" ]]; then
@@ -233,13 +266,9 @@ locate_binary_for_module() {
     fi
   done
 
-  basename="${sanitized##*/}"
-  if [[ -z "$basename" ]]; then
-    basename="$sanitized"
-  fi
-
+  # 3) basename 回退：在目录下递归按文件名查找
   for dir in "${RESOLVED_SYMBOL_DIRS[@]}"; do
-    candidate=$(find "$dir" -type f -name "$basename" -print -quit 2>/dev/null)
+    candidate=$(find "$dir" -type f -name "$module_basename" -print -quit 2>/dev/null)
     if [[ -n "$candidate" ]]; then
       BINARY_CACHE["$module_path"]="$candidate"
       debug_log "module $module_path resolved to $candidate via basename search"
@@ -363,12 +392,16 @@ prepare_address_metadata() {
   return 0
 }
 
-symbolize_address() {
-  # Turn a hex address into symbol text; respects ELF type and location-format.
+compute_rel_hex_for_token() {
+  # Compute relative hex address for addr2line based on ELF type; caches per token.
   local token="$1"
   local status="${ADDRESS_META[$token]:-}"
   if [[ "$status" != "READY" ]]; then
     return 1
+  fi
+
+  if [[ -n "${ADDRESS_RELHEX[$token]:-}" ]]; then
+    return 0
   fi
 
   local segment_idx="${ADDRESS_SEGMENT[$token]:-}"
@@ -397,7 +430,34 @@ symbolize_address() {
     printf -v rel_hex "0x%x" "$rel_dec"
   fi
 
-  debug_log "addr $token module=$module_path binary=$binary_path elf=$elf_type adjust=0x$(printf '%x' "$adjust") rel=$rel_hex"
+  debug_log "addr $token module=$module_path binary=$binary_path rel=$rel_hex"
+  ADDRESS_RELHEX["$token"]="$rel_hex"
+  return 0
+}
+
+symbolize_address() {
+  # Turn a hex address into symbol text; respects ELF type and location-format.
+  local token="$1"
+  local status="${ADDRESS_META[$token]:-}"
+  if [[ "$status" != "READY" ]]; then
+    return 1
+  fi
+
+  local segment_idx="${ADDRESS_SEGMENT[$token]:-}"
+  local binary_path="${ADDRESS_BINARY[$token]:-}"
+  local module_path="${ADDRESS_MODULE[$token]:-}"
+  if [[ -z "$segment_idx" || -z "$binary_path" ]]; then
+    ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
+    return 1
+  fi
+
+  local elf_type rel_hex
+  if ! compute_rel_hex_for_token "$token"; then
+    return 1
+  fi
+  rel_hex="${ADDRESS_RELHEX[$token]}"
+  elf_type="${MODULE_TYPES[$binary_path]:-UNKNOWN}"
+  debug_log "addr $token module=$module_path binary=$binary_path elf=$elf_type rel=$rel_hex"
 
   local cmd=("$ADDR2LINE_BIN" "-f" "-C")
   if [[ -n "$ADDR2LINE_FLAGS" ]]; then
@@ -461,6 +521,84 @@ resolve_frame_token() {
   printf '%s' "$token"
 }
 
+symbolize_batch_for_binary() {
+  # Batch symbolize multiple addresses for the same binary in one addr2line call.
+  local binary="$1"
+  local tokens_str="$2"
+  local rels_str="$3"
+
+  local -a tokens=()
+  local -a rels=()
+  read -r -a tokens <<< "$tokens_str"
+  read -r -a rels <<< "$rels_str"
+  if [[ ${#tokens[@]} -eq 0 ]]; then
+    return
+  fi
+
+  ((++BATCH_CALLS))
+  debug_log "batch addr2line binary=$binary count=${#tokens[@]}"
+
+  local cmd=("$ADDR2LINE_BIN" "-f" "-C")
+  if [[ -n "$ADDR2LINE_FLAGS" ]]; then
+    local extra_flags=()
+    read -r -a extra_flags <<< "$ADDR2LINE_FLAGS"
+    if [[ ${#extra_flags[@]} -gt 0 ]]; then
+      cmd+=("${extra_flags[@]}")
+    fi
+  fi
+  cmd+=("-e" "$binary")
+  cmd+=("${rels[@]}")
+
+  local -a lines=()
+  if ! mapfile -t lines < <("${cmd[@]}" 2>/dev/null); then
+    warn "addr2line batch failed for $binary"
+    for token in "${tokens[@]}"; do
+      if symbol=$(symbolize_address "$token"); then
+        ADDRESS_CACHE["$token"]="$symbol"
+      else
+        ADDRESS_CACHE["$token"]="$token"
+      fi
+    done
+    return
+  fi
+
+  local expected=$(( ${#tokens[@]} * 2 ))
+  if (( ${#lines[@]} < expected )); then
+    debug_log "addr2line batch output mismatch for $binary (got ${#lines[@]}, expected $expected); falling back"
+    for token in "${tokens[@]}"; do
+      if symbol=$(symbolize_address "$token"); then
+        ADDRESS_CACHE["$token"]="$symbol"
+      else
+        ADDRESS_CACHE["$token"]="$token"
+      fi
+    done
+    return
+  fi
+
+  local idx token func src module_path pretty
+  for idx in "${!tokens[@]}"; do
+    token="${tokens[$idx]}"
+    func="${lines[$((idx*2))]:-??}"
+    src="${lines[$((idx*2+1))]:-??:0}"
+    module_path="${ADDRESS_MODULE[$token]:-}"
+    if [[ -z "$func" ]]; then func="??"; fi
+    if [[ -z "$src" ]]; then src="??:0"; fi
+
+    if [[ "$func" == "??" || "$src" == "??:0" || "$src" == "??" ]]; then
+      if [[ -n "$module_path" ]]; then
+        MODULE_BLOCKED["$module_path"]=1
+        warn_once "NOSYMBOL::$module_path" "missing symbols for $module_path; keeping raw addresses"
+      fi
+      ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
+      ADDRESS_CACHE["$token"]="$token"
+      continue
+    fi
+
+    pretty=$(render_symbol "$func" "$src")
+    ADDRESS_CACHE["$token"]="$pretty"
+  done
+}
+
 process_stack_line() {
   local line="$1"
 
@@ -479,11 +617,68 @@ process_stack_line() {
     return
   fi
 
+  ((++LINES_PROCESSED))
+  if [[ $DEBUG_MODE -eq 1 && $((LINES_PROCESSED % 1000)) -eq 0 ]]; then
+    debug_log "progress lines=$LINES_PROCESSED batches=$BATCH_CALLS"
+  fi
+
   IFS=';' read -r -a frames <<< "$stack_part"
-  local idx frame
+
+  declare -A batch_tokens=()
+  declare -A batch_rels=()
+
+  local idx frame binary token
   for idx in "${!frames[@]}"; do
     frame="$(trim_whitespace "${frames[$idx]}")"
-    frames[$idx]="$(resolve_frame_token "$frame")"
+
+    if [[ -n "${ADDRESS_CACHE[$frame]:-}" ]]; then
+      frames[$idx]="${ADDRESS_CACHE[$frame]}"
+      continue
+    fi
+
+    if ! is_hex_address "$frame"; then
+      ADDRESS_CACHE["$frame"]="$frame"
+      frames[$idx]="$frame"
+      continue
+    fi
+
+    if ! prepare_address_metadata "$frame"; then
+      ADDRESS_CACHE["$frame"]="$frame"
+      frames[$idx]="$frame"
+      continue
+    fi
+
+    if ! compute_rel_hex_for_token "$frame"; then
+      ADDRESS_CACHE["$frame"]="$frame"
+      frames[$idx]="$frame"
+      continue
+    fi
+
+    binary="${ADDRESS_BINARY[$frame]}"
+    if [[ -n "${batch_tokens[$binary]+set}" ]]; then
+      batch_tokens["$binary"]+=" $frame"
+    else
+      batch_tokens["$binary"]="$frame"
+    fi
+
+    if [[ -n "${batch_rels[$binary]+set}" ]]; then
+      batch_rels["$binary"]+=" ${ADDRESS_RELHEX[$frame]}"
+    else
+      batch_rels["$binary"]="${ADDRESS_RELHEX[$frame]}"
+    fi
+    frames[$idx]="$frame"
+  done
+
+  local bin
+  for bin in "${!batch_tokens[@]}"; do
+    symbolize_batch_for_binary "$bin" "${batch_tokens[$bin]}" "${batch_rels[$bin]}"
+  done
+
+  for idx in "${!frames[@]}"; do
+    token="${frames[$idx]}"
+    if [[ -n "${ADDRESS_CACHE[$token]:-}" ]]; then
+      frames[$idx]="${ADDRESS_CACHE[$token]}"
+    fi
   done
 
   local joined
@@ -583,6 +778,14 @@ if [[ "$OUTPUT_PATH" != "-" ]]; then
   fi
 fi
 
+if [[ "$INPUT_PATH" != "-" && "$OUTPUT_PATH" != "-" ]]; then
+  abs_in=$(cd "$(dirname "$INPUT_PATH")" && pwd -P)/"$(basename "$INPUT_PATH")"
+  abs_out=$(cd "$(dirname "$OUTPUT_PATH")" && pwd -P)/"$(basename "$OUTPUT_PATH")"
+  if [[ "$abs_in" == "$abs_out" ]]; then
+    abort "Input and output paths are identical; use distinct files to avoid overwrite"
+  fi
+fi
+
 if ! command -v "$ADDR2LINE_BIN" >/dev/null 2>&1; then
   abort "addr2line binary not found: $ADDR2LINE_BIN"
 fi
@@ -596,6 +799,9 @@ fi
 
 # Placeholder for future stages
 run_symbolization() {
+  WARN_ONCE_FILE=$(mktemp 2>/dev/null || printf '/tmp/resolve-stacks.warnonce.$$')
+  trap 'rm -f "$WARN_ONCE_FILE"' EXIT
+
   resolve_symbol_dirs
   load_maps
 
