@@ -1,3 +1,0 @@
-main (main.c:42);helper_one (helper.c:10);helper_two (helper.c:25) 12
-worker (main.c:87);main (main.c:42) 5
-helper_two (helper.c:25);helper_one (helper.c:10);main (main.c:42) 3
