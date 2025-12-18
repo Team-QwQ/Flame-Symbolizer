@@ -86,6 +86,13 @@ declare -A MODULE_TYPES=()      # binary path -> ELF type
 declare -A MODULE_BLOCKED=()    # module path -> blocked (missing symbols)
 declare -A WARNED_ONCE=()       # dedupe warnings per key
 WARN_ONCE_FILE=""
+declare -a ADDR2LINE_BASE=()    # prebuilt addr2line argv prefix
+declare -A MODULE_HIT_SEEN=()   # module path -> seen as hit
+declare -A MODULE_MISS_SEEN=()  # module path -> seen as miss
+
+MODULE_RESOLVE_HITS=0
+MODULE_RESOLVE_MISS=0
+ADDR2LINE_SKIPPED=0
 
 LINES_PROCESSED=0
 BATCH_CALLS=0
@@ -93,6 +100,22 @@ BATCH_CALLS=0
 SYMBOL_SEARCH_AVAILABLE=0
 readonly MISSING_BINARY_SENTINEL="__MISSING_BINARY__"
 readonly UNRESOLVABLE_SENTINEL="__UNRESOLVABLE__"
+
+# Initialize warn-once file early so pre-run_symbolization warnings do not fail
+WARN_ONCE_FILE=$(mktemp 2>/dev/null || printf '/tmp/resolve-stacks.warnonce.$$')
+touch "$WARN_ONCE_FILE" 2>/dev/null || true
+trap 'rm -f "$WARN_ONCE_FILE"' EXIT
+
+prepare_addr2line_base() {
+  ADDR2LINE_BASE=("$ADDR2LINE_BIN" "-f" "-C")
+  if [[ -n "$ADDR2LINE_FLAGS" ]]; then
+    local extra_flags=()
+    read -r -a extra_flags <<< "$ADDR2LINE_FLAGS"
+    if [[ ${#extra_flags[@]} -gt 0 ]]; then
+      ADDR2LINE_BASE+=("${extra_flags[@]}")
+    fi
+  fi
+}
 
 
 trim_whitespace() {
@@ -249,6 +272,10 @@ locate_binary_for_module() {
     candidate="${dir%/}/${module_basename}"
     if [[ -f "$candidate" ]]; then
       BINARY_CACHE["$module_path"]="$candidate"
+      if [[ -z "${MODULE_HIT_SEEN[$module_path]:-}" ]]; then
+        MODULE_HIT_SEEN["$module_path"]=1
+        ((++MODULE_RESOLVE_HITS))
+      fi
       debug_log "module $module_path resolved to $candidate via root-flat"
       printf '%s' "$candidate"
       return 0
@@ -260,6 +287,10 @@ locate_binary_for_module() {
     candidate="${dir%/}/${sanitized}"
     if [[ -f "$candidate" ]]; then
       BINARY_CACHE["$module_path"]="$candidate"
+      if [[ -z "${MODULE_HIT_SEEN[$module_path]:-}" ]]; then
+        MODULE_HIT_SEEN["$module_path"]=1
+        ((++MODULE_RESOLVE_HITS))
+      fi
       debug_log "module $module_path resolved to $candidate via sysroot path"
       printf '%s' "$candidate"
       return 0
@@ -271,6 +302,10 @@ locate_binary_for_module() {
     candidate=$(find "$dir" -type f -name "$module_basename" -print -quit 2>/dev/null)
     if [[ -n "$candidate" ]]; then
       BINARY_CACHE["$module_path"]="$candidate"
+      if [[ -z "${MODULE_HIT_SEEN[$module_path]:-}" ]]; then
+        MODULE_HIT_SEEN["$module_path"]=1
+        ((++MODULE_RESOLVE_HITS))
+      fi
       debug_log "module $module_path resolved to $candidate via basename search"
       printf '%s' "$candidate"
       return 0
@@ -278,6 +313,10 @@ locate_binary_for_module() {
   done
 
   BINARY_CACHE["$module_path"]="$MISSING_BINARY_SENTINEL"
+  if [[ -z "${MODULE_MISS_SEEN[$module_path]:-}" ]]; then
+    MODULE_MISS_SEEN["$module_path"]=1
+    ((++MODULE_RESOLVE_MISS))
+  fi
   warn_once "MISSBIN::$module_path" "missing binary for $module_path"
   return 1
 }
@@ -459,14 +498,7 @@ symbolize_address() {
   elf_type="${MODULE_TYPES[$binary_path]:-UNKNOWN}"
   debug_log "addr $token module=$module_path binary=$binary_path elf=$elf_type rel=$rel_hex"
 
-  local cmd=("$ADDR2LINE_BIN" "-f" "-C")
-  if [[ -n "$ADDR2LINE_FLAGS" ]]; then
-    local extra_flags=()
-    read -r -a extra_flags <<< "$ADDR2LINE_FLAGS"
-    if [[ ${#extra_flags[@]} -gt 0 ]]; then
-      cmd+=("${extra_flags[@]}")
-    fi
-  fi
+  local cmd=("${ADDR2LINE_BASE[@]}")
   cmd+=("-e" "$binary_path" "$rel_hex")
 
   local -a lines=()
@@ -484,6 +516,7 @@ symbolize_address() {
   if [[ "$func" == "??" || "$src" == "??:0" || "$src" == "??" ]]; then
     MODULE_BLOCKED["$module_path"]=1
     warn_once "NOSYMBOL::$module_path" "missing symbols for $module_path; keeping raw addresses"
+    ((++ADDR2LINE_SKIPPED))
     ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
     return 1
   fi
@@ -538,14 +571,7 @@ symbolize_batch_for_binary() {
   ((++BATCH_CALLS))
   debug_log "batch addr2line binary=$binary count=${#tokens[@]}"
 
-  local cmd=("$ADDR2LINE_BIN" "-f" "-C")
-  if [[ -n "$ADDR2LINE_FLAGS" ]]; then
-    local extra_flags=()
-    read -r -a extra_flags <<< "$ADDR2LINE_FLAGS"
-    if [[ ${#extra_flags[@]} -gt 0 ]]; then
-      cmd+=("${extra_flags[@]}")
-    fi
-  fi
+  local cmd=("${ADDR2LINE_BASE[@]}")
   cmd+=("-e" "$binary")
   cmd+=("${rels[@]}")
 
@@ -589,6 +615,7 @@ symbolize_batch_for_binary() {
         MODULE_BLOCKED["$module_path"]=1
         warn_once "NOSYMBOL::$module_path" "missing symbols for $module_path; keeping raw addresses"
       fi
+      ((++ADDR2LINE_SKIPPED))
       ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
       ADDRESS_CACHE["$token"]="$token"
       continue
@@ -790,6 +817,9 @@ if ! command -v "$ADDR2LINE_BIN" >/dev/null 2>&1; then
   abort "addr2line binary not found: $ADDR2LINE_BIN"
 fi
 
+# Build addr2line base argv once for reuse in batch/single calls
+prepare_addr2line_base
+
 if ! command -v "$READ_ELF_BIN" >/dev/null 2>&1; then
   READ_ELF_AVAILABLE=0
   warn_once "READ_ELF_MISSING" "readelf not found (${READ_ELF_BIN}); ELF 类型将视为未知并使用相对地址策略"
@@ -799,9 +829,6 @@ fi
 
 # Placeholder for future stages
 run_symbolization() {
-  WARN_ONCE_FILE=$(mktemp 2>/dev/null || printf '/tmp/resolve-stacks.warnonce.$$')
-  trap 'rm -f "$WARN_ONCE_FILE"' EXIT
-
   resolve_symbol_dirs
   load_maps
 
@@ -816,6 +843,10 @@ run_symbolization() {
     process_stream <"$input_source"
   else
     process_stream <"$input_source" >"$OUTPUT_PATH"
+  fi
+
+  if [[ $DEBUG_MODE -eq 1 ]]; then
+    debug_log "summary lines=$LINES_PROCESSED batches=$BATCH_CALLS modules_hit=$MODULE_RESOLVE_HITS modules_miss=$MODULE_RESOLVE_MISS addr2line_skipped=$ADDR2LINE_SKIPPED"
   fi
 }
 
