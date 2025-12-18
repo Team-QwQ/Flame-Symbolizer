@@ -344,8 +344,13 @@ detect_elf_type() {
     return 0
   fi
 
-  local type_line type
-  type_line=$(printf '%s\n' "$header" | grep -i "Type:" | head -n1)
+  local type_line="" line type
+  while IFS= read -r line; do
+    if [[ "$line" == *Type:* ]]; then
+      type_line="$line"
+      break
+    fi
+  done <<< "$header"
   if [[ "$type_line" == *EXEC* ]]; then
     type="ET_EXEC"
   elif [[ "$type_line" == *DYN* ]]; then
