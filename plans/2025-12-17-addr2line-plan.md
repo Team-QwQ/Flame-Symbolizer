@@ -1,7 +1,7 @@
 # addr2line 符号化脚本实施计划
 
 ## 范围与参考
-- 目标：实现一套可多次执行的 shell 脚本，依据 maps + 符号目录将 stackcollapse 输出中的地址替换为函数名。
+- 目标：实现一套可多次执行的 shell 脚本，依据 maps + 符号目录将 stackcollapse 输出中的地址替换为函数名，包含 ELF 类型自动识别、输出格式开关与调试/告警策略。
 - 规范：依据 [specs/addr2line-symbolizer.md](specs/addr2line-symbolizer.md)。
 
 ## 假设与不在范围内
@@ -15,42 +15,43 @@
 
 ## 实施阶段与步骤
 1. **脚本骨架与参数解析**
-   - 使用 POSIX Shell（bash）编写 `scripts/resolve-stacks.sh`，支持 `--maps`、`--symbol-dir`（可多次）、`--addr2line`、`--addr2line-flags`、`--input`/`--output`（默认为 stdin/stdout）。
-   - 明确帮助信息与错误码，确保缺失必需参数时立即退出。
+   - 扩展 `scripts/resolve-stacks.sh` 参数：必选 `--maps`，可选多次 `--symbol-dir`，`--toolchain-prefix`（调用 `addr2line`/`readelf` 等前缀），`--addr2line` 覆盖，`--addr2line-flags` 透传，`--input`/`--output`（默认 stdin/stdout），`--location-format`（none|short|full，默认 short），`--debug`。
+   - 完善帮助与错误码，缺失必需参数或不可读文件时立即退出。
 
 2. **基础管线实现**
-   - 逐行读取输入，解析 `;` 分隔的帧与尾部计数，识别纯地址帧。
-   - 建立地址缓存，避免重复调用 `addr2line`。
-   - 保持输出格式与输入一致，仅替换命中的地址。
+   - 逐行解析 stackcollapse 行，分割帧与计数，识别 `0x` 地址帧。
+   - 地址级缓存避免重复解析；输出格式保持一致，仅替换可解析的地址。
+   - 根据 `--location-format` 控制输出：默认函数名+短文件名+行号；`none` 去掉 file:line；`full` 带路径文件名。
 
 3. **maps 解析与符号目录匹配**
-   - 解析 maps 文件，构建按地址范围查找的段表（按起始地址排序）。
-   - 基于段表命中结果推导模块路径，按声明顺序在 `--symbol-dir` 列表中查找匹配文件（先视 maps 路径为 sysroot，下沉到仅文件名）。
-   - 找不到时输出 `[WARN]` 信息并跳过替换。
+   - 解析 maps 构建段表，基于地址命中获得模块路径与偏移。
+   - 在 `--symbol-dir` 中按顺序查找：先 sysroot 拼接路径，再按文件名查找；缓存命中结果。
+   - 找不到模块二进制或文件无符号表时输出警告（默认模式也输出），对每个模块/地址段仅告警一次并标记不可解析，后续不再尝试。
 
-4. **addr2line 调用与结果处理**
-   - 组合 `addr2line` 命令行（支持自定义路径与 flags），传入“实际地址 = 原地址 - 段起始”。
-   - 解析返回的函数名、源文件与行号，若为 `??:0` 或命令失败则保留原地址。
-   - 对成功解析的结果进行适度格式化（如 `function (file:line)`），并缓存。
+4. **ELF 类型识别与 addr2line 调用**
+   - 使用 toolchain 前缀的 `readelf`（或缺省）探测模块 ELF 类型：`ET_EXEC` 直接用运行时地址；`ET_DYN`/DSO 使用基址调整（start - offset）；无法识别类型时退化为相对地址策略。
+   - 组合 `addr2line` 调用（前缀或覆盖路径 + 透传 flags），失败或返回 `??` 视为未解析并保留原地址。
+   - 解析结果按所选输出格式渲染并缓存。
 
-5. **校验与辅助脚本**
-   - 编写示例输入/输出以及 sanity-test 脚本，至少覆盖：
-     - 正常解析（maps 路径直接可用）。
-     - 需通过 `--symbol-dir` 匹配的场景。
-     - 未找到符号时输出警告但不中断。
-   - 更新 README 或新增文档片段说明使用方式。
+5. **调试与可见性**
+   - `--debug` 模式下输出段表、符号目录命中、地址调整决策到 stderr；stdout 不受影响。
+   - 默认模式也输出缺失二进制/无符号表的告警，一次性告警后跳过后续同段解析。
+
+6. **校验与文档**
+   - 增补/调整测试夹具，覆盖：非 PIE `ET_EXEC` 绝对地址解析、PIE/DSO 相对地址解析、符号缺失一次性告警、location-format 三种模式、toolchain 前缀与显式 addr2line 覆盖。
+   - 更新 README/使用说明，展示新参数与示例。
 
 ## 依赖与风险
-- 依赖：`addr2line` 可执行文件（可配置路径）；shell 运行环境（bash, coreutils, awk/sed/grep）。
+- 依赖：`addr2line`、`readelf`（可通过工具链前缀获取），bash 及常用 coreutils/grep/sed/awk。
 - 风险：
-  - maps 与 stackcollapse 不匹配导致偏移错误——需在脚本中检测无段命中时给出提示。
-  - 大型输入导致性能瓶颈——通过缓存与尽量少的子进程调用缓解。
+   - maps 与 stackcollapse 不匹配导致偏移错误——需在脚本中检测无段命中时提示并保留原地址。
+   - 大型输入导致性能瓶颈——通过缓存与减少子进程调用缓解。
+   - 非 PIE/PIE 判断错误导致偏移不准——通过 readelf 探测类型，探测失败时至少退化为相对地址并告警。
 
 ## 验证策略
-- 单元式验证：使用人工构造的 maps + 对应 ELF，确认地址偏移正确。
-- 集成验证：以真实 stackcollapse 样本跑脚本，确保输出可被 flamegraph.pl 正常消费。
-- 错误路径：刻意删除 symbol-dir 中的文件，观察脚本是否输出警告但继续执行。
+- 单元式验证：构造 ET_EXEC 与 ET_DYN 的样例，确认绝对地址与基址调整路径都正确。
+- 集成验证：以真实 stackcollapse 样本跑脚本，验证 location-format 输出、符号缺失一次性告警、toolchain 前缀/覆盖路径。
+- 错误路径：刻意缺失符号目录或去除符号表，确保输出警告但不中断，且同段仅告警一次。
 
 ## 审批状态
-- `/do` 阶段已执行完毕：脚本、夹具与 README 更新全部落地。
-- 自动化夹具 (`tests/run-fixture.sh`) 因终端环境 `ENOPRO` 错误暂未在此环境跑通，待终端恢复后执行一次以完成最终验证。
+- 当前处于 `/plan` 阶段，等待确认上述更新后的计划后进入 `/do` 实施。

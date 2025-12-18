@@ -12,8 +12,11 @@ Optional:
   --symbol-dir DIR            Directory containing symbolized binaries; may be repeated, supports glob/relative paths.
   --input FILE                Input file (stackcollapse format). Defaults to stdin when omitted or set to '-'.
   --output FILE               Output file. Defaults to stdout when omitted or set to '-'.
+  --toolchain-prefix STR      Prefix for cross toolchain (e.g. aarch64-linux-gnu-); applied to readelf/addr2line.
   --addr2line PATH            addr2line binary to invoke (default: value of $ADDR2LINE or 'addr2line').
   --addr2line-flags STRING    Extra flags passed verbatim to addr2line (e.g. "-f -C").
+  --location-format MODE      none|short|full; default short (function + basename + line; full keeps path; none hides file:line).
+  --debug                     Enable verbose debug logging to stderr (segment table, symbol hits, adjustments).
   -h, --help                  Show this message and exit.
 EOF
 }
@@ -27,12 +30,34 @@ warn() {
   echo "[WARN] $1" >&2
 }
 
+warn_once() {
+  local key="$1" msg="$2"
+  if [[ -n "${WARNED_ONCE[$key]:-}" ]]; then
+    return
+  fi
+  WARNED_ONCE["$key"]=1
+  warn "$msg"
+}
+
+debug_log() {
+  if [[ $DEBUG_MODE -eq 1 ]]; then
+    echo "[DEBUG] $*" >&2
+  fi
+}
+
 MAPS_FILE=""
 SYMBOL_DIRS=()
 INPUT_PATH="-"
 OUTPUT_PATH="-"
 ADDR2LINE_BIN="${ADDR2LINE:-addr2line}"
 ADDR2LINE_FLAGS=""
+TOOLCHAIN_PREFIX=""
+READ_ELF_BIN="readelf"
+LOCATION_FORMAT="short"
+DEBUG_MODE=0
+
+ADDR2LINE_OVERRIDDEN=0
+READ_ELF_AVAILABLE=1
 
 declare -A ADDRESS_CACHE=()
 declare -a MAP_STARTS=()
@@ -46,6 +71,9 @@ declare -A ADDRESS_META=()
 declare -A ADDRESS_SEGMENT=()
 declare -A ADDRESS_BINARY=()
 declare -A ADDRESS_MODULE=()
+declare -A MODULE_TYPES=()
+declare -A MODULE_BLOCKED=()
+declare -A WARNED_ONCE=()
 
 SYMBOL_SEARCH_AVAILABLE=0
 readonly MISSING_BINARY_SENTINEL="__MISSING_BINARY__"
@@ -115,6 +143,12 @@ resolve_symbol_dirs() {
     SYMBOL_SEARCH_AVAILABLE=0
   else
     SYMBOL_SEARCH_AVAILABLE=1
+    if [[ $DEBUG_MODE -eq 1 ]]; then
+      local dir
+      for dir in "${RESOLVED_SYMBOL_DIRS[@]}"; do
+        debug_log "symbol-dir resolved: $dir"
+      done
+    fi
   fi
 }
 
@@ -147,6 +181,8 @@ load_maps() {
       MAP_OFFSETS+=("$offset_dec")
       MAP_PATHS+=("$path")
       MAP_ADJUSTS+=("$adjust")
+
+      debug_log "maps segment start=0x$(printf '%x' "$start_dec") end=0x$(printf '%x' "$end_dec") offset=0x$(printf '%x' "$offset_dec") path=$path adjust=0x$(printf '%x' "$adjust")"
     fi
   done <"$MAPS_FILE"
 
@@ -190,6 +226,7 @@ locate_binary_for_module() {
     candidate="${dir%/}/${sanitized}"
     if [[ -f "$candidate" ]]; then
       BINARY_CACHE["$module_path"]="$candidate"
+      debug_log "module $module_path resolved to $candidate via sysroot path"
       printf '%s' "$candidate"
       return 0
     fi
@@ -204,6 +241,7 @@ locate_binary_for_module() {
     candidate=$(find "$dir" -type f -name "$basename" -print -quit 2>/dev/null)
     if [[ -n "$candidate" ]]; then
       BINARY_CACHE["$module_path"]="$candidate"
+      debug_log "module $module_path resolved to $candidate via basename search"
       printf '%s' "$candidate"
       return 0
     fi
@@ -212,6 +250,70 @@ locate_binary_for_module() {
   BINARY_CACHE["$module_path"]="$MISSING_BINARY_SENTINEL"
   warn "missing binary for $module_path"
   return 1
+}
+
+detect_elf_type() {
+  local binary="$1"
+  local cached="${MODULE_TYPES[$binary]:-}"
+  if [[ -n "$cached" ]]; then
+    printf '%s' "$cached"
+    return 0
+  fi
+
+  if [[ $READ_ELF_AVAILABLE -eq 0 ]]; then
+    MODULE_TYPES["$binary"]="UNKNOWN"
+    printf '%s' "UNKNOWN"
+    return 0
+  fi
+
+  local header
+  if ! header=$("$READ_ELF_BIN" -h "$binary" 2>/dev/null); then
+    MODULE_TYPES["$binary"]="UNKNOWN"
+    debug_log "readelf failed for $binary; treating type as UNKNOWN"
+    printf '%s' "UNKNOWN"
+    return 0
+  fi
+
+  local type_line type
+  type_line=$(printf '%s\n' "$header" | grep -i "Type:" | head -n1)
+  if [[ "$type_line" == *EXEC* ]]; then
+    type="ET_EXEC"
+  elif [[ "$type_line" == *DYN* ]]; then
+    type="ET_DYN"
+  else
+    type="UNKNOWN"
+  fi
+
+  MODULE_TYPES["$binary"]="$type"
+  printf '%s' "$type"
+}
+
+render_symbol() {
+  local func="$1" src="$2"
+  case "$LOCATION_FORMAT" in
+    none)
+      printf '%s' "$func"
+      ;;
+    short)
+      local file="${src%%:*}"
+      local line="${src##*:}"
+      if [[ -z "$file" || "$file" == "??" ]]; then
+        printf '%s' "$func"
+      else
+        file="${file##*/}"
+        printf '%s (%s:%s)' "$func" "$file" "$line"
+      fi
+      ;;
+    full)
+      local file="${src%%:*}"
+      local line="${src##*:}"
+      if [[ -z "$file" || "$file" == "??" ]]; then
+        printf '%s' "$func"
+      else
+        printf '%s (%s:%s)' "$func" "$file" "$line"
+      fi
+      ;;
+  esac
 }
 
 prepare_address_metadata() {
@@ -237,11 +339,18 @@ prepare_address_metadata() {
     return 1
   fi
 
+  if [[ -n "${MODULE_BLOCKED[$module_path]:-}" ]]; then
+    ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
+    return 1
+  fi
+
   local binary_path
   if ! binary_path=$(locate_binary_for_module "$module_path"); then
     ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
     return 1
   fi
+
+  debug_log "address $token -> module $module_path binary $binary_path"
 
   ADDRESS_SEGMENT["$token"]="$segment_idx"
   ADDRESS_BINARY["$token"]="$binary_path"
@@ -267,14 +376,23 @@ symbolize_address() {
 
   local adjust="${MAP_ADJUSTS[$segment_idx]}"
   local addr_dec=$((token))
-  local rel_dec=$((addr_dec - adjust))
-  if (( rel_dec < 0 )); then
-    warn "address $token yielded negative relative offset for $module_path"
-    ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
-    return 1
+  local rel_dec rel_hex elf_type
+
+  elf_type=$(detect_elf_type "$binary_path")
+  if [[ "$elf_type" == "ET_EXEC" ]]; then
+    rel_dec=$addr_dec
+    printf -v rel_hex "0x%x" "$rel_dec"
+  else
+    rel_dec=$((addr_dec - adjust))
+    if (( rel_dec < 0 )); then
+      warn "address $token yielded negative relative offset for $module_path"
+      ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
+      return 1
+    fi
+    printf -v rel_hex "0x%x" "$rel_dec"
   fi
 
-  printf -v rel_hex "0x%x" "$rel_dec"
+  debug_log "addr $token module=$module_path binary=$binary_path elf=$elf_type adjust=0x$(printf '%x' "$adjust") rel=$rel_hex"
 
   local cmd=("$ADDR2LINE_BIN" "-f" "-C")
   if [[ -n "$ADDR2LINE_FLAGS" ]]; then
@@ -298,17 +416,16 @@ symbolize_address() {
   if [[ -z "$func" ]]; then func="??"; fi
   if [[ -z "$src" ]]; then src="??:0"; fi
 
-  local pretty
-  if [[ "$src" == "??:0" || "$src" == "??" ]]; then
-    if [[ "$func" == "??" ]]; then
-      ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
-      return 1
-    fi
-    pretty="$func ($module_path)"
-  else
-    pretty="$func ($src)"
+  if [[ "$func" == "??" || "$src" == "??:0" || "$src" == "??" ]]; then
+    MODULE_BLOCKED["$module_path"]=1
+    warn_once "NOSYMBOL::$module_path" "missing symbols for $module_path; keeping raw addresses"
+    ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
+    return 1
   fi
 
+  local pretty
+  pretty=$(render_symbol "$func" "$src")
+  debug_log "addr $token resolved to $pretty"
   printf '%s' "$pretty"
 }
 
@@ -399,10 +516,22 @@ while (($#)); do
     --addr2line)
       shift || abort "--addr2line requires a binary path"
       ADDR2LINE_BIN="$1"
+      ADDR2LINE_OVERRIDDEN=1
       ;;
     --addr2line-flags)
       shift || abort "--addr2line-flags requires a string"
       ADDR2LINE_FLAGS="$1"
+      ;;
+    --toolchain-prefix)
+      shift || abort "--toolchain-prefix requires a prefix"
+      TOOLCHAIN_PREFIX="$1"
+      ;;
+    --location-format)
+      shift || abort "--location-format requires a mode (none|short|full)"
+      LOCATION_FORMAT="$1"
+      ;;
+    --debug)
+      DEBUG_MODE=1
       ;;
     -h|--help)
       print_help
@@ -422,6 +551,18 @@ while (($#)); do
   shift || true
 done
 
+case "$LOCATION_FORMAT" in
+  none|short|full) ;;
+  *) abort "Invalid --location-format: $LOCATION_FORMAT (expected none|short|full)" ;;
+esac
+
+if [[ -n "$TOOLCHAIN_PREFIX" ]]; then
+  READ_ELF_BIN="${TOOLCHAIN_PREFIX}readelf"
+  if [[ $ADDR2LINE_OVERRIDDEN -eq 0 ]]; then
+    ADDR2LINE_BIN="${TOOLCHAIN_PREFIX}addr2line"
+  fi
+fi
+
 [[ -n "$MAPS_FILE" ]] || abort "--maps is required"
 [[ -r "$MAPS_FILE" ]] || abort "Cannot read maps file: $MAPS_FILE"
 
@@ -438,6 +579,13 @@ fi
 
 if ! command -v "$ADDR2LINE_BIN" >/dev/null 2>&1; then
   abort "addr2line binary not found: $ADDR2LINE_BIN"
+fi
+
+if ! command -v "$READ_ELF_BIN" >/dev/null 2>&1; then
+  READ_ELF_AVAILABLE=0
+  warn_once "READ_ELF_MISSING" "readelf not found (${READ_ELF_BIN}); ELF 类型将视为未知并使用相对地址策略"
+else
+  READ_ELF_AVAILABLE=1
 fi
 
 # Placeholder for future stages
