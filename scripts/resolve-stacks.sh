@@ -60,20 +60,20 @@ ADDR2LINE_OVERRIDDEN=0
 READ_ELF_AVAILABLE=1
 
 declare -A ADDRESS_CACHE=()
-declare -a MAP_STARTS=()
-declare -a MAP_ENDS=()
-declare -a MAP_OFFSETS=()
-declare -a MAP_PATHS=()
-declare -a MAP_ADJUSTS=()
+declare -a MAP_STARTS=()    # segment starts (decimal)
+declare -a MAP_ENDS=()      # segment ends (decimal)
+declare -a MAP_OFFSETS=()   # file offsets
+declare -a MAP_PATHS=()     # module paths from maps
+declare -a MAP_ADJUSTS=()   # start - offset
 declare -a RESOLVED_SYMBOL_DIRS=()
-declare -A BINARY_CACHE=()
-declare -A ADDRESS_META=()
-declare -A ADDRESS_SEGMENT=()
-declare -A ADDRESS_BINARY=()
-declare -A ADDRESS_MODULE=()
-declare -A MODULE_TYPES=()
-declare -A MODULE_BLOCKED=()
-declare -A WARNED_ONCE=()
+declare -A BINARY_CACHE=()      # module_path -> binary path (or sentinel)
+declare -A ADDRESS_META=()      # token -> READY/UNRESOLVABLE
+declare -A ADDRESS_SEGMENT=()   # token -> segment index
+declare -A ADDRESS_BINARY=()    # token -> binary path
+declare -A ADDRESS_MODULE=()    # token -> module path
+declare -A MODULE_TYPES=()      # binary path -> ELF type
+declare -A MODULE_BLOCKED=()    # module path -> blocked (missing symbols)
+declare -A WARNED_ONCE=()       # dedupe warnings per key
 
 SYMBOL_SEARCH_AVAILABLE=0
 readonly MISSING_BINARY_SENTINEL="__MISSING_BINARY__"
@@ -153,6 +153,7 @@ resolve_symbol_dirs() {
 }
 
 load_maps() {
+  # Parse maps file into parallel arrays for fast segment lookup.
   MAP_STARTS=()
   MAP_ENDS=()
   MAP_OFFSETS=()
@@ -216,7 +217,7 @@ locate_binary_for_module() {
 
   if [[ $SYMBOL_SEARCH_AVAILABLE -eq 0 ]]; then
     BINARY_CACHE["$module_path"]="$MISSING_BINARY_SENTINEL"
-    warn "No symbol directories available to resolve $module_path"
+    warn_once "NOSYMDIR::$module_path" "No symbol directories available to resolve $module_path"
     return 1
   fi
 
@@ -248,11 +249,12 @@ locate_binary_for_module() {
   done
 
   BINARY_CACHE["$module_path"]="$MISSING_BINARY_SENTINEL"
-  warn "missing binary for $module_path"
+  warn_once "MISSBIN::$module_path" "missing binary for $module_path"
   return 1
 }
 
 detect_elf_type() {
+  # Use readelf to choose between ET_EXEC (no adjust) and ET_DYN (apply adjust); cache per binary.
   local binary="$1"
   local cached="${MODULE_TYPES[$binary]:-}"
   if [[ -n "$cached" ]]; then
@@ -289,6 +291,7 @@ detect_elf_type() {
 }
 
 render_symbol() {
+  # Format function + source according to location-format (none|short|full).
   local func="$1" src="$2"
   case "$LOCATION_FORMAT" in
     none)
@@ -317,6 +320,7 @@ render_symbol() {
 }
 
 prepare_address_metadata() {
+  # Derive module/binary for a raw address; cache status to avoid repeat work.
   local token="$1"
   local status="${ADDRESS_META[$token]:-}"
   if [[ -n "$status" ]]; then
@@ -360,6 +364,7 @@ prepare_address_metadata() {
 }
 
 symbolize_address() {
+  # Turn a hex address into symbol text; respects ELF type and location-format.
   local token="$1"
   local status="${ADDRESS_META[$token]:-}"
   if [[ "$status" != "READY" ]]; then
@@ -430,6 +435,7 @@ symbolize_address() {
 }
 
 resolve_frame_token() {
+  # Resolve a single frame token; non-hex tokens pass through unchanged.
   local token="$1"
   if [[ -n "${ADDRESS_CACHE[$token]:-}" ]]; then
     printf '%s' "${ADDRESS_CACHE[$token]}"
