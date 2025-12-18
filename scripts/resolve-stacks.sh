@@ -83,7 +83,6 @@ declare -A ADDRESS_SEGMENT=()   # token -> segment index
 declare -A ADDRESS_BINARY=()    # token -> binary path
 declare -A ADDRESS_MODULE=()    # token -> module path
 declare -A MODULE_TYPES=()      # binary path -> ELF type
-declare -A MODULE_BLOCKED=()    # module path -> blocked (missing symbols)
 declare -A WARNED_ONCE=()       # dedupe warnings per key
 WARN_ONCE_FILE=""
 declare -a ADDR2LINE_BASE=()    # prebuilt addr2line argv prefix
@@ -416,11 +415,6 @@ prepare_address_metadata() {
     return 1
   fi
 
-  if [[ -n "${MODULE_BLOCKED[$module_path]:-}" ]]; then
-    ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
-    return 1
-  fi
-
   local binary_path
   if ! binary_path=$(locate_binary_for_module "$module_path"); then
     ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
@@ -519,8 +513,7 @@ symbolize_address() {
   if [[ -z "$src" ]]; then src="??:0"; fi
 
   if [[ "$func" == "??" || "$src" == "??:0" || "$src" == "??" ]]; then
-    MODULE_BLOCKED["$module_path"]=1
-    warn_once "NOSYMBOL::$module_path" "missing symbols for $module_path; keeping raw addresses"
+    warn "missing symbols for $module_path; keeping raw addresses"
     ((++ADDR2LINE_SKIPPED))
     ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
     return 1
@@ -530,33 +523,6 @@ symbolize_address() {
   pretty=$(render_symbol "$func" "$src")
   debug_log "addr $token resolved to $pretty"
   printf '%s' "$pretty"
-}
-
-resolve_frame_token() {
-  # Resolve a single frame token; non-hex tokens pass through unchanged.
-  local token="$1"
-  if [[ -n "${ADDRESS_CACHE[$token]:-}" ]]; then
-    printf '%s' "${ADDRESS_CACHE[$token]}"
-    return
-  fi
-
-  if ! is_hex_address "$token"; then
-    ADDRESS_CACHE["$token"]="$token"
-    printf '%s' "$token"
-    return
-  fi
-
-  if prepare_address_metadata "$token"; then
-    local symbol
-    if symbol=$(symbolize_address "$token"); then
-      ADDRESS_CACHE["$token"]="$symbol"
-      printf '%s' "$symbol"
-      return
-    fi
-  fi
-
-  ADDRESS_CACHE["$token"]="$token"
-  printf '%s' "$token"
 }
 
 symbolize_batch_for_binary() {
@@ -617,8 +583,7 @@ symbolize_batch_for_binary() {
 
     if [[ "$func" == "??" || "$src" == "??:0" || "$src" == "??" ]]; then
       if [[ -n "$module_path" ]]; then
-        MODULE_BLOCKED["$module_path"]=1
-        warn_once "NOSYMBOL::$module_path" "missing symbols for $module_path; keeping raw addresses"
+        warn "missing symbols for $module_path; keeping raw addresses"
       fi
       ((++ADDR2LINE_SKIPPED))
       ADDRESS_META["$token"]="$UNRESOLVABLE_SENTINEL"
