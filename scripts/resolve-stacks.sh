@@ -66,6 +66,9 @@ READ_ELF_BIN="readelf"
 LOCATION_FORMAT="short"
 DEBUG_MODE=0
 
+# Maximum number of addresses per addr2line call (chunked per binary to avoid argv limits)
+MAX_ADDRS_PER_CHUNK=256
+
 ADDR2LINE_OVERRIDDEN=0
 READ_ELF_AVAILABLE=1
 
@@ -88,6 +91,10 @@ WARN_ONCE_FILE=""
 declare -a ADDR2LINE_BASE=()    # prebuilt addr2line argv prefix
 declare -A MODULE_HIT_SEEN=()   # module path -> seen as hit
 declare -A MODULE_MISS_SEEN=()  # module path -> seen as miss
+
+declare -A BUCKET_TOKENS=()     # binary -> space-separated tokens (deduped)
+declare -A BUCKET_RELS=()       # binary -> space-separated rel addresses
+declare -A BUCKET_SEEN=()       # key(binary::token) -> 1 to dedupe per binary
 
 MODULE_RESOLVE_HITS=0
 MODULE_RESOLVE_MISS=0
@@ -596,100 +603,153 @@ symbolize_batch_for_binary() {
   done
 }
 
-process_stack_line() {
-  local line="$1"
+# First pass: collect all addresses grouped by binary, deduped, without invoking addr2line
+first_pass_collect() {
+  BUCKET_TOKENS=()
+  BUCKET_RELS=()
+  BUCKET_SEEN=()
 
-  if [[ -z "$line" ]]; then
-    printf '\n'
-    return
-  fi
+  local line stack_part count
+  local frames idx frame binary key
 
-  local stack_part count
-  if [[ "$line" =~ ^(.+[^[:space:]])[[:space:]]+([0-9]+)$ ]]; then
-    stack_part="${BASH_REMATCH[1]}"
-    count="${BASH_REMATCH[2]}"
-  else
-    warn "Malformed stack line (kept as-is): $line"
-    printf '%s\n' "$line"
-    return
-  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
 
-  ((++LINES_PROCESSED))
-  if [[ $DEBUG_MODE -eq 1 && $((LINES_PROCESSED % 1000)) -eq 0 ]]; then
-    debug_log "progress lines=$LINES_PROCESSED batches=$BATCH_CALLS"
-  fi
-
-  IFS=';' read -r -a frames <<< "$stack_part"
-
-  declare -A batch_tokens=()
-  declare -A batch_rels=()
-
-  local idx frame binary token
-  for idx in "${!frames[@]}"; do
-    frame="$(trim_whitespace "${frames[$idx]}")"
-
-    if [[ -n "${ADDRESS_CACHE[$frame]:-}" ]]; then
-      frames[$idx]="${ADDRESS_CACHE[$frame]}"
-      continue
-    fi
-
-    if ! is_hex_address "$frame"; then
-      ADDRESS_CACHE["$frame"]="$frame"
-      frames[$idx]="$frame"
-      continue
-    fi
-
-    if ! prepare_address_metadata "$frame"; then
-      ADDRESS_CACHE["$frame"]="$frame"
-      frames[$idx]="$frame"
-      continue
-    fi
-
-    if ! compute_rel_hex_for_token "$frame"; then
-      ADDRESS_CACHE["$frame"]="$frame"
-      frames[$idx]="$frame"
-      continue
-    fi
-
-    binary="${ADDRESS_BINARY[$frame]}"
-    if [[ -n "${batch_tokens[$binary]+set}" ]]; then
-      batch_tokens["$binary"]+=" $frame"
+    if [[ "$line" =~ ^(.+[^[:space:]])[[:space:]]+([0-9]+)$ ]]; then
+      stack_part="${BASH_REMATCH[1]}"
+      count="${BASH_REMATCH[2]}"
     else
-      batch_tokens["$binary"]="$frame"
+      # keep malformed lines untouched in second pass; no address collection needed
+      continue
     fi
 
-    if [[ -n "${batch_rels[$binary]+set}" ]]; then
-      batch_rels["$binary"]+=" ${ADDRESS_RELHEX[$frame]}"
-    else
-      batch_rels["$binary"]="${ADDRESS_RELHEX[$frame]}"
-    fi
-    frames[$idx]="$frame"
-  done
+    IFS=';' read -r -a frames <<< "$stack_part"
 
-  local bin
-  for bin in "${!batch_tokens[@]}"; do
-    symbolize_batch_for_binary "$bin" "${batch_tokens[$bin]}" "${batch_rels[$bin]}"
-  done
+    for idx in "${!frames[@]}"; do
+      frame="$(trim_whitespace "${frames[$idx]}")"
 
-  for idx in "${!frames[@]}"; do
-    token="${frames[$idx]}"
-    if [[ -n "${ADDRESS_CACHE[$token]:-}" ]]; then
-      frames[$idx]="${ADDRESS_CACHE[$token]}"
-    fi
-  done
+      if [[ -n "${ADDRESS_CACHE[$frame]:-}" ]]; then
+        continue
+      fi
 
-  local joined
-  local IFS=';'
-  joined="${frames[*]}"
-  printf '%s %s\n' "$joined" "$count"
+      if ! is_hex_address "$frame"; then
+        ADDRESS_CACHE["$frame"]="$frame"
+        continue
+      fi
+
+      if ! prepare_address_metadata "$frame"; then
+        ADDRESS_CACHE["$frame"]="$frame"
+        continue
+      fi
+
+      if ! compute_rel_hex_for_token "$frame"; then
+        ADDRESS_CACHE["$frame"]="$frame"
+        continue
+      fi
+
+      binary="${ADDRESS_BINARY[$frame]}"
+      key="$binary::$frame"
+      if [[ -n "${BUCKET_SEEN[$key]:-}" ]]; then
+        continue
+      fi
+      BUCKET_SEEN["$key"]=1
+
+      if [[ -n "${BUCKET_TOKENS[$binary]+set}" ]]; then
+        BUCKET_TOKENS["$binary"]+=" $frame"
+        BUCKET_RELS["$binary"]+=" ${ADDRESS_RELHEX[$frame]}"
+      else
+        BUCKET_TOKENS["$binary"]="$frame"
+        BUCKET_RELS["$binary"]="${ADDRESS_RELHEX[$frame]}"
+      fi
+    done
+  done <"$INPUT_PATH"
 }
 
-process_stream() {
-  local line
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    process_stack_line "$line"
-    line=""
+symbolize_bucket_chunk() {
+  local binary="$1" tokens_str="$2" rels_str="$3"
+  if [[ -z "$tokens_str" || -z "$rels_str" ]]; then
+    return
+  fi
+  symbolize_batch_for_binary "$binary" "$tokens_str" "$rels_str"
+}
+
+run_batch_symbolization() {
+  local bin tokens_str rels_str
+  local -a tokens=()
+  local -a rels=()
+  for bin in "${!BUCKET_TOKENS[@]}"; do
+    tokens_str="${BUCKET_TOKENS[$bin]}"
+    rels_str="${BUCKET_RELS[$bin]}"
+    tokens=()
+    rels=()
+    read -r -a tokens <<< "$tokens_str"
+    read -r -a rels <<< "$rels_str"
+    if [[ ${#tokens[@]} -ne ${#rels[@]} ]]; then
+      warn "token/rel mismatch for $bin; falling back to per-address resolution"
+      local idx
+      for idx in "${!tokens[@]}"; do
+        if symbol=$(symbolize_address "${tokens[$idx]}"); then
+          ADDRESS_CACHE["${tokens[$idx]}"]="$symbol"
+        else
+          ADDRESS_CACHE["${tokens[$idx]}"]="${tokens[$idx]}"
+        fi
+      done
+      continue
+    fi
+
+    local start=0 end=0
+    while (( start < ${#tokens[@]} )); do
+      end=$(( start + MAX_ADDRS_PER_CHUNK ))
+      if (( end > ${#tokens[@]} )); then
+        end=${#tokens[@]}
+      fi
+
+      local chunk_tokens=()
+      local chunk_rels=()
+      chunk_tokens=( "${tokens[@]:start:end-start}" )
+      chunk_rels=( "${rels[@]:start:end-start}" )
+
+      symbolize_bucket_chunk "$bin" "${chunk_tokens[*]}" "${chunk_rels[*]}"
+
+      start=$end
+    done
   done
+}
+
+# Second pass: emit output using cache (no additional addr2line calls)
+second_pass_emit() {
+  local line stack_part count
+  local frames idx token joined
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    ((++LINES_PROCESSED))
+
+    if [[ -z "$line" ]]; then
+      printf '\n'
+      continue
+    fi
+
+    if [[ "$line" =~ ^(.+[^[:space:]])[[:space:]]+([0-9]+)$ ]]; then
+      stack_part="${BASH_REMATCH[1]}"
+      count="${BASH_REMATCH[2]}"
+    else
+      printf '%s\n' "$line"
+      continue
+    fi
+
+    IFS=';' read -r -a frames <<< "$stack_part"
+    for idx in "${!frames[@]}"; do
+      token="$(trim_whitespace "${frames[$idx]}")"
+      if [[ -n "${ADDRESS_CACHE[$token]:-}" ]]; then
+        frames[$idx]="${ADDRESS_CACHE[$token]}"
+      else
+        frames[$idx]="$token"
+      fi
+    done
+
+    local IFS=';'
+    joined="${frames[*]}"
+    printf '%s %s\n' "$joined" "$count"
+  done <"$INPUT_PATH"
 }
 
 # argument parsing
@@ -805,7 +865,9 @@ run_symbolization() {
   resolve_symbol_dirs
   load_maps
 
-  process_stream <"$INPUT_PATH" >"$OUTPUT_PATH"
+  first_pass_collect
+  run_batch_symbolization
+  second_pass_emit >"$OUTPUT_PATH"
 
   if [[ $DEBUG_MODE -eq 1 ]]; then
     debug_log "summary lines=$LINES_PROCESSED batches=$BATCH_CALLS modules_hit=$MODULE_RESOLVE_HITS modules_miss=$MODULE_RESOLVE_MISS addr2line_skipped=$ADDR2LINE_SKIPPED"

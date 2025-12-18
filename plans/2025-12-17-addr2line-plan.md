@@ -18,10 +18,10 @@
    - 扩展 `scripts/resolve-stacks.sh` 参数：必选 `--maps`，可选多次 `--symbol-dir`，`--toolchain-prefix`（调用 `addr2line`/`readelf` 等前缀），`--addr2line` 覆盖，`--addr2line-flags` 透传，`--input`/`--output`（均为文件路径，不支持 stdin/stdout），`--location-format`（none|short|full，默认 short），`--debug`。
    - 完善帮助与错误码，缺失必需参数、输入不可读、输出目录不存在、输入输出路径相同等场景立即退出。
 
-2. **基础管线实现**
-   - 逐行解析 stackcollapse 行，分割帧与计数，识别 `0x` 地址帧。
-   - 地址级缓存避免重复解析；输出格式保持一致，仅替换可解析的地址。
-   - 根据 `--location-format` 控制输出：默认函数名+短文件名+行号；`none` 去掉 file:line；`full` 带路径文件名。
+2. **基础管线实现（两阶段批处理）**
+   - 第一次遍历：读取全量输入，分割帧与计数，收集所有 `0x` 地址，按模块分桶并去重；不考虑内存占用。
+   - 对每个模块的地址集合分块调用 `addr2line -e <binary> <addr1..>`，块大小设保守上限以兼容常见 addr2line 参数数量限制；命中结果与 `??` 均写入缓存/负缓存。
+   - 第二次遍历/回填：基于缓存将各行对应地址替换为符号，保持原行序与计数；输出格式按 `--location-format`（none|short|full）渲染。
 
 3. **maps 解析与符号目录匹配**
    - 解析 maps 构建段表，基于地址命中获得模块路径与偏移。
@@ -40,8 +40,8 @@
    - 默认模式下：缺失二进制警告一次/模块；符号缺失/`??` 可多次警告，但后续地址仍会尝试解析。
 
 6. **校验与文档**
-   - 增补/调整测试夹具，覆盖：非 PIE `ET_EXEC` 绝对地址解析、PIE/DSO 相对地址解析、符号缺失一次性告警、location-format 三种模式、toolchain 前缀与显式 addr2line 覆盖。
-   - 更新 README/使用说明，展示新参数与示例。
+   - 增补/调整测试夹具，覆盖：非 PIE `ET_EXEC` 绝对地址解析、PIE/DSO 相对地址解析、符号缺失一次性告警、location-format 三种模式、toolchain 前缀与显式 addr2line 覆盖；验证分桶批处理与分块上限生效（过多地址时仍可正确拆分调用）。
+   - 更新 README/使用说明，展示新参数与示例，并说明两阶段批处理与 addr2line 分块策略。
 
 ## 依赖与风险
 - 依赖：`addr2line`、`readelf`（可通过工具链前缀获取），bash 及常用 coreutils/grep/sed/awk。
