@@ -44,3 +44,10 @@ bash tests/run-fixture.sh
 4. 比对结果与 `tests/fixtures/sample.expected`，确保解析流程稳定。
 
 若需在真实数据上测试，只需替换 `--maps` / `--symbol-dir` / `--input` 参数，并提供可执行的 `addr2line`。脚本会在无法找到匹配模块或符号时输出 `[WARN]`，但保持流水线继续执行。
+
+## 辅助脚本
+- heaptrack 原始数据转 stackcollapse：`scripts/auxiliary/heaptrack-to-raw-stack.sh <heaptrack.raw.gz> [output_stack_file]`
+	- 依赖 `heaptrack_interpret`、`heaptrack_print`，默认输出 `stack.txt`。
+- 渲染泄漏火焰图：`scripts/auxiliary/render-leak-flamegraph.sh [stack_file] [output_svg]`
+	- 默认输入 `./stack.txt`、输出 `raw-leak.svg`，可用环境变量 `FLAMEGRAPH_BIN` 指定 `flamegraph.pl` 路径。
+- 两个脚本均支持 `-h/--help` 查看内置用法说明。
