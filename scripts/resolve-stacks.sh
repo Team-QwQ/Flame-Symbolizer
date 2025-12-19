@@ -240,13 +240,31 @@ load_maps() {
 
 find_map_segment() {
   local addr_dec="$1"
-  local idx
-  for idx in "${!MAP_STARTS[@]}"; do
-    if (( addr_dec >= MAP_STARTS[idx] && addr_dec < MAP_ENDS[idx] )); then
-      printf '%s' "$idx"
-      return 0
+  local lo=0
+  local hi=$(( ${#MAP_STARTS[@]} - 1 ))
+  local mid=-1
+  local candidate=-1
+
+  # maps 行天然按 start 升序，二分找最后一个 start <= addr_dec
+  while (( lo <= hi )); do
+    mid=$(((lo + hi) / 2))
+    if (( addr_dec < MAP_STARTS[mid] )); then
+      hi=$(( mid - 1 ))
+    else
+      candidate=$mid
+      lo=$(( mid + 1 ))
     fi
   done
+
+  if (( candidate >= 0 && addr_dec < MAP_ENDS[candidate] )); then
+    # 如存在相同 start 的多段，向左回溯保持与线扫一致的最左匹配
+    while (( candidate > 0 && MAP_STARTS[candidate-1] == MAP_STARTS[candidate] && addr_dec < MAP_ENDS[candidate-1] )); do
+      candidate=$(( candidate - 1 ))
+    done
+    printf '%s' "$candidate"
+    return 0
+  fi
+
   return 1
 }
 
