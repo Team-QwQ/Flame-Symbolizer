@@ -95,7 +95,7 @@ declare -A MODULE_MISS_SEEN=()  # module path -> seen as miss
 
 declare -A BUCKET_TOKENS=()     # binary -> space-separated tokens (deduped)
 declare -A BUCKET_RELS=()       # binary -> space-separated rel addresses
-declare -A BUCKET_SEEN=()       # key(binary::token) -> 1 to dedupe per binary
+declare -A RAW_ADDR_SEEN=()     # raw address string -> seen flag for global dedup
 
 MODULE_RESOLVE_HITS=0
 MODULE_RESOLVE_MISS=0
@@ -609,7 +609,7 @@ symbolize_batch_for_binary() {
 first_pass_collect() {
   BUCKET_TOKENS=()
   BUCKET_RELS=()
-  BUCKET_SEEN=()
+  RAW_ADDR_SEEN=()
 
   local line stack_part count
   local frames idx frame binary key
@@ -655,6 +655,12 @@ first_pass_collect() {
         continue
       fi
 
+      if [[ -n "${RAW_ADDR_SEEN[$frame]:-}" ]]; then
+        continue
+      fi
+
+      RAW_ADDR_SEEN["$frame"]=1
+
       if ! prepare_address_metadata "$frame"; then
         ADDRESS_CACHE["$frame"]="$frame"
         continue
@@ -666,12 +672,6 @@ first_pass_collect() {
       fi
 
       binary="${ADDRESS_BINARY[$frame]}"
-      key="$binary::$frame"
-      if [[ -n "${BUCKET_SEEN[$key]:-}" ]]; then
-        continue
-      fi
-      BUCKET_SEEN["$key"]=1
-
       if [[ -n "${BUCKET_TOKENS[$binary]+set}" ]]; then
         BUCKET_TOKENS["$binary"]+=" $frame"
         BUCKET_RELS["$binary"]+=" ${ADDRESS_RELHEX[$frame]}"
