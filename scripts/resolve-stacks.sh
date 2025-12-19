@@ -55,6 +55,10 @@ debug_log() {
   fi
 }
 
+info_log() {
+  echo "[INFO] $*" >&2
+}
+
 MAPS_FILE=""
 SYMBOL_DIRS=()
 INPUT_PATH=""
@@ -96,6 +100,8 @@ declare -A MODULE_MISS_SEEN=()  # module path -> seen as miss
 declare -A BUCKET_TOKENS=()     # binary -> space-separated tokens (deduped)
 declare -A BUCKET_RELS=()       # binary -> space-separated rel addresses
 declare -A RAW_ADDR_SEEN=()     # raw address string -> seen flag for global dedup
+TMP_FRAMES_FILE=""
+TMP_ADDRS_FILE=""
 
 MODULE_RESOLVE_HITS=0
 MODULE_RESOLVE_MISS=0
@@ -104,6 +110,9 @@ ADDR2LINE_SKIPPED=0
 LINES_PROCESSED=0
 BATCH_CALLS=0
 TOTAL_INPUT_LINES=0
+INPLACE_MODE=0
+OUTPUT_ACTUAL=""
+OUTPUT_TMP_FILE=""
 
 SYMBOL_SEARCH_AVAILABLE=0
 readonly MISSING_BINARY_SENTINEL="__MISSING_BINARY__"
@@ -629,84 +638,86 @@ first_pass_collect() {
   BUCKET_RELS=()
   RAW_ADDR_SEEN=()
 
-  local line stack_part count
-  local frames idx frame binary key
-  local lines_seen=0
+  TMP_FRAMES_FILE=$(mktemp 2>/dev/null || printf '/tmp/resolve-stacks.frames.$$')
+  TMP_ADDRS_FILE=$(mktemp 2>/dev/null || printf '/tmp/resolve-stacks.addrs.$$')
+
   local log_step=$PROGRESS_LOG_EVERY
+  TOTAL_INPUT_LINES=$(wc -l < "$INPUT_PATH" 2>/dev/null || printf '0')
+  info_log "first_pass_collect start: total_lines=$TOTAL_INPUT_LINES"
 
-  if [[ $DEBUG_MODE -eq 1 ]]; then
-    TOTAL_INPUT_LINES=$(wc -l < "$INPUT_PATH" 2>/dev/null || printf '0')
-    debug_log "first_pass_collect start: total_lines=$TOTAL_INPUT_LINES"
-  fi
+  awk -v frames_out="$TMP_FRAMES_FILE" -v addrs_out="$TMP_ADDRS_FILE" -v log_step="$log_step" -v total_lines="$TOTAL_INPUT_LINES" '
+    BEGIN { FS = ""; OFS = "\t" }
+    function trim(s) { sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s); return s }
+    function ishex(s) { return (s ~ /^0x[0-9a-fA-F]+$/) }
+    {
+      raw = $0
+      if (log_step > 0 && (NR % log_step) == 0) {
+        if (total_lines > 0) {
+          printf("[INFO] first_pass_collect progress: lines=%d/%d\n", NR, total_lines) > "/dev/stderr"
+        } else {
+          printf("[INFO] first_pass_collect progress: lines=%d\n", NR) > "/dev/stderr"
+        }
+      }
+      if (raw == "") { print "B" > frames_out; next }
+      if (raw ~ /^(.+[^[:space:]])[[:space:]]+([0-9]+)$/) {
+        count = gensub(/^(.+[^[:space:]]*)[[:space:]]+([0-9]+)$/, "\\2", 1, raw)
+        stack = gensub(/^(.+[^[:space:]]*)[[:space:]]+([0-9]+)$/, "\\1", 1, raw)
+      } else {
+        print "M", raw > frames_out
+        next
+      }
 
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    ((++lines_seen))
-    if [[ $DEBUG_MODE -eq 1 && $log_step -gt 0 && $((lines_seen % log_step)) -eq 0 ]]; then
-      if [[ $TOTAL_INPUT_LINES -gt 0 ]]; then
-        debug_log "first_pass_collect progress: lines=${lines_seen}/${TOTAL_INPUT_LINES}"
-      else
-        debug_log "first_pass_collect progress: lines=$lines_seen"
-      fi
-    fi
+      n = split(stack, arr, ";")
+      printf("F\t%s", count) > frames_out
+      for (i = 1; i <= n; i++) {
+        frame = trim(arr[i])
+        printf("\t%s", frame) > frames_out
+        if (ishex(frame) && !(frame in seen)) {
+          print frame > addrs_out
+          seen[frame] = 1
+        }
+      }
+      printf("\n") > frames_out
+    }
+  ' "$INPUT_PATH"
 
-    [[ -z "$line" ]] && continue
+  # consume unique addresses to build buckets
+  local addr binary idx=0 unique_addrs=0
+  unique_addrs=$(wc -l < "$TMP_ADDRS_FILE" 2>/dev/null || printf '0')
+  info_log "first_pass_collect buckets: unique_addrs=$unique_addrs"
+  while IFS= read -r addr || [[ -n "$addr" ]]; do
+    ((++idx))
+    RAW_ADDR_SEEN["$addr"]=1
 
-    if [[ "$line" =~ ^(.+[^[:space:]])[[:space:]]+([0-9]+)$ ]]; then
-      stack_part="${BASH_REMATCH[1]}"
-      count="${BASH_REMATCH[2]}"
-    else
-      # keep malformed lines untouched in second pass; no address collection needed
+    if ! prepare_address_metadata "$addr"; then
+      ADDRESS_CACHE["$addr"]="$addr"
       continue
     fi
 
-    IFS=';' read -r -a frames <<< "$stack_part"
-
-    for idx in "${!frames[@]}"; do
-      frame="$(trim_whitespace "${frames[$idx]}")"
-
-      if [[ -n "${ADDRESS_CACHE[$frame]:-}" ]]; then
-        continue
-      fi
-
-      if ! is_hex_address "$frame"; then
-        ADDRESS_CACHE["$frame"]="$frame"
-        continue
-      fi
-
-      if [[ -n "${RAW_ADDR_SEEN[$frame]:-}" ]]; then
-        continue
-      fi
-
-      RAW_ADDR_SEEN["$frame"]=1
-
-      if ! prepare_address_metadata "$frame"; then
-        ADDRESS_CACHE["$frame"]="$frame"
-        continue
-      fi
-
-      if ! compute_rel_hex_for_token "$frame"; then
-        ADDRESS_CACHE["$frame"]="$frame"
-        continue
-      fi
-
-      binary="${ADDRESS_BINARY[$frame]}"
-      if [[ -n "${BUCKET_TOKENS[$binary]+set}" ]]; then
-        BUCKET_TOKENS["$binary"]+=" $frame"
-        BUCKET_RELS["$binary"]+=" ${ADDRESS_RELHEX[$frame]}"
-      else
-        BUCKET_TOKENS["$binary"]="$frame"
-        BUCKET_RELS["$binary"]="${ADDRESS_RELHEX[$frame]}"
-      fi
-    done
-  done <"$INPUT_PATH"
-
-  if [[ $DEBUG_MODE -eq 1 ]]; then
-    if [[ $TOTAL_INPUT_LINES -gt 0 ]]; then
-      debug_log "first_pass_collect done: lines=${lines_seen}/${TOTAL_INPUT_LINES} buckets=${#BUCKET_TOKENS[@]}"
-    else
-      debug_log "first_pass_collect done: lines=$lines_seen buckets=${#BUCKET_TOKENS[@]}"
+    if ! compute_rel_hex_for_token "$addr"; then
+      ADDRESS_CACHE["$addr"]="$addr"
+      continue
     fi
-  fi
+
+    binary="${ADDRESS_BINARY[$addr]}"
+    if [[ -n "${BUCKET_TOKENS[$binary]+set}" ]]; then
+      BUCKET_TOKENS["$binary"]+=" $addr"
+      BUCKET_RELS["$binary"]+=" ${ADDRESS_RELHEX[$addr]}"
+    else
+      BUCKET_TOKENS["$binary"]="$addr"
+      BUCKET_RELS["$binary"]="${ADDRESS_RELHEX[$addr]}"
+    fi
+
+    if [[ $log_step -gt 0 && $((idx % log_step)) -eq 0 ]]; then
+      if [[ $unique_addrs -gt 0 ]]; then
+        info_log "first_pass_collect buckets progress: addrs=${idx}/${unique_addrs}"
+      else
+        info_log "first_pass_collect buckets progress: addrs=${idx}"
+      fi
+    fi
+  done <"$TMP_ADDRS_FILE"
+
+  info_log "first_pass_collect done: lines=$TOTAL_INPUT_LINES buckets=${#BUCKET_TOKENS[@]}"
 }
 
 symbolize_bucket_chunk() {
@@ -725,9 +736,7 @@ run_batch_symbolization() {
   local total_batches=0
   local log_step=$PROGRESS_LOG_EVERY
 
-  if [[ $DEBUG_MODE -eq 1 ]]; then
-    debug_log "run_batch_symbolization start"
-  fi
+  info_log "run_batch_symbolization start"
   for bin in "${!BUCKET_TOKENS[@]}"; do
     tokens_str="${BUCKET_TOKENS[$bin]}"
     rels_str="${BUCKET_RELS[$bin]}"
@@ -767,11 +776,11 @@ run_batch_symbolization() {
       symbolize_bucket_chunk "$bin" "${chunk_tokens[*]}" "${chunk_rels[*]}"
 
       ((++processed_batches))
-      if [[ $DEBUG_MODE -eq 1 && $log_step -gt 0 && $((processed_batches % log_step)) -eq 0 ]]; then
+      if [[ $log_step -gt 0 && $((processed_batches % log_step)) -eq 0 ]]; then
         if [[ $total_batches -gt 0 ]]; then
-          debug_log "run_batch_symbolization progress: batches=${processed_batches}/${total_batches}"
+          info_log "run_batch_symbolization progress: batches=${processed_batches}/${total_batches}"
         else
-          debug_log "run_batch_symbolization progress: batches=$processed_batches"
+          info_log "run_batch_symbolization progress: batches=$processed_batches"
         fi
       fi
 
@@ -779,66 +788,63 @@ run_batch_symbolization() {
     done
   done
 
-  if [[ $DEBUG_MODE -eq 1 ]]; then
-    if [[ $total_batches -gt 0 ]]; then
-      debug_log "run_batch_symbolization done: batches=${processed_batches}/${total_batches}"
-    else
-      debug_log "run_batch_symbolization done: batches=$processed_batches"
-    fi
+  if [[ $total_batches -gt 0 ]]; then
+    info_log "run_batch_symbolization done: batches=${processed_batches}/${total_batches}"
+  else
+    info_log "run_batch_symbolization done: batches=$processed_batches"
   fi
 }
 
 # Second pass: emit output using cache (no additional addr2line calls)
 second_pass_emit() {
-  local line stack_part count
-  local frames idx token joined
+  local kind count frame idx joined
   local log_step=$PROGRESS_LOG_EVERY
-  while IFS= read -r line || [[ -n "$line" ]]; do
+
+  while IFS=$'\t' read -r -a cols || [[ ${#cols[@]} -gt 0 ]]; do
     ((++LINES_PROCESSED))
 
-    if [[ $DEBUG_MODE -eq 1 && $log_step -gt 0 && $((LINES_PROCESSED % log_step)) -eq 0 ]]; then
+    if [[ $log_step -gt 0 && $((LINES_PROCESSED % log_step)) -eq 0 ]]; then
       if [[ $TOTAL_INPUT_LINES -gt 0 ]]; then
-        debug_log "second_pass_emit progress: lines=${LINES_PROCESSED}/${TOTAL_INPUT_LINES}"
+        info_log "second_pass_emit progress: lines=${LINES_PROCESSED}/${TOTAL_INPUT_LINES}"
       else
-        debug_log "second_pass_emit progress: lines=$LINES_PROCESSED"
+        info_log "second_pass_emit progress: lines=$LINES_PROCESSED"
       fi
     fi
 
-    if [[ -z "$line" ]]; then
+    if [[ ${#cols[@]} -eq 0 ]]; then
       printf '\n'
       continue
     fi
 
-    if [[ "$line" =~ ^(.+[^[:space:]])[[:space:]]+([0-9]+)$ ]]; then
-      stack_part="${BASH_REMATCH[1]}"
-      count="${BASH_REMATCH[2]}"
-    else
-      printf '%s\n' "$line"
+    kind="${cols[0]}"
+    if [[ "$kind" == "B" ]]; then
+      printf '\n'
+      continue
+    fi
+    if [[ "$kind" == "M" ]]; then
+      printf '%s\n' "${cols[1]}"
       continue
     fi
 
-    IFS=';' read -r -a frames <<< "$stack_part"
-    for idx in "${!frames[@]}"; do
-      token="$(trim_whitespace "${frames[$idx]}")"
-      if [[ -n "${ADDRESS_CACHE[$token]:-}" ]]; then
-        frames[$idx]="${ADDRESS_CACHE[$token]}"
+    count="${cols[1]}"
+    joined=""
+    for idx in "${!cols[@]}"; do
+      (( idx <= 1 )) && continue
+      frame="${cols[$idx]}"
+      if [[ -n "${ADDRESS_CACHE[$frame]:-}" ]]; then
+        frame="${ADDRESS_CACHE[$frame]}"
+      fi
+      if [[ -z "$joined" ]]; then
+        joined="$frame"
       else
-        frames[$idx]="$token"
+        joined+=";$frame"
       fi
     done
 
-    local IFS=';'
-    joined="${frames[*]}"
     printf '%s %s\n' "$joined" "$count"
-  done <"$INPUT_PATH"
+  done <"$TMP_FRAMES_FILE"
 
-  if [[ $DEBUG_MODE -eq 1 ]]; then
-    if [[ $TOTAL_INPUT_LINES -gt 0 ]]; then
-      debug_log "second_pass_emit done: lines=${LINES_PROCESSED}/${TOTAL_INPUT_LINES}"
-    else
-      debug_log "second_pass_emit done: lines=$LINES_PROCESSED"
-    fi
-  fi
+  info_log "second_pass_emit done: lines=${LINES_PROCESSED}/${TOTAL_INPUT_LINES}"
 }
 
 # argument parsing
@@ -919,7 +925,10 @@ if [[ "$INPUT_PATH" == "-" ]]; then
 fi
 [[ -r "$INPUT_PATH" ]] || abort "Cannot read input file: $INPUT_PATH"
 
-[[ -n "$OUTPUT_PATH" ]] || abort "--output is required"
+# Default to in-place overwrite when --output is omitted
+if [[ -z "$OUTPUT_PATH" ]]; then
+  OUTPUT_PATH="$INPUT_PATH"
+fi
 if [[ "$OUTPUT_PATH" == "-" ]]; then
   abort "Stdout is not supported; provide --output FILE"
 fi
@@ -932,7 +941,11 @@ fi
 abs_in=$(cd "$(dirname "$INPUT_PATH")" && pwd -P)/"$(basename "$INPUT_PATH")"
 abs_out=$(cd "$(dirname "$OUTPUT_PATH")" && pwd -P)/"$(basename "$OUTPUT_PATH")"
 if [[ "$abs_in" == "$abs_out" ]]; then
-  abort "Input and output paths are identical; use distinct files to avoid overwrite"
+  INPLACE_MODE=1
+  OUTPUT_TMP_FILE=$(mktemp -p "$OUTPUT_DIR" ".resolve-stacks.tmp.XXXXXX") || abort "Failed to create temporary output file in $OUTPUT_DIR"
+  OUTPUT_ACTUAL="$OUTPUT_TMP_FILE"
+else
+  OUTPUT_ACTUAL="$OUTPUT_PATH"
 fi
 
 if ! command -v "$ADDR2LINE_BIN" >/dev/null 2>&1; then
@@ -956,11 +969,29 @@ run_symbolization() {
 
   first_pass_collect
   run_batch_symbolization
-  second_pass_emit >"$OUTPUT_PATH"
+  second_pass_emit >"$OUTPUT_ACTUAL"
 
-  if [[ $DEBUG_MODE -eq 1 ]]; then
-    debug_log "summary lines=$LINES_PROCESSED batches=$BATCH_CALLS modules_hit=$MODULE_RESOLVE_HITS modules_miss=$MODULE_RESOLVE_MISS addr2line_skipped=$ADDR2LINE_SKIPPED"
+  if [[ $INPLACE_MODE -eq 1 ]]; then
+    if command -v python3 >/dev/null 2>&1; then
+      python3 - <<'PY' "$OUTPUT_ACTUAL" || warn "fsync failed for temporary output: $OUTPUT_ACTUAL"
+import os, sys
+path = sys.argv[1]
+fd = os.open(path, os.O_RDONLY)
+try:
+    os.fsync(fd)
+finally:
+    os.close(fd)
+PY
+    else
+      sync 2>/dev/null || true
+    fi
+
+    if ! mv -f "$OUTPUT_ACTUAL" "$OUTPUT_PATH"; then
+      abort "In-place overwrite failed; temporary output preserved at $OUTPUT_ACTUAL"
+    fi
   fi
+
+  info_log "summary lines=$LINES_PROCESSED batches=$BATCH_CALLS modules_hit=$MODULE_RESOLVE_HITS modules_miss=$MODULE_RESOLVE_MISS addr2line_skipped=$ADDR2LINE_SKIPPED"
 }
 
 run_symbolization
