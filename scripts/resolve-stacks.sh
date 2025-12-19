@@ -68,6 +68,7 @@ DEBUG_MODE=0
 
 # Maximum number of addresses per addr2line call (chunked per binary to avoid argv limits)
 MAX_ADDRS_PER_CHUNK=256
+PROGRESS_LOG_EVERY=1000
 
 ADDR2LINE_OVERRIDDEN=0
 READ_ELF_AVAILABLE=1
@@ -102,6 +103,7 @@ ADDR2LINE_SKIPPED=0
 
 LINES_PROCESSED=0
 BATCH_CALLS=0
+TOTAL_INPUT_LINES=0
 
 SYMBOL_SEARCH_AVAILABLE=0
 readonly MISSING_BINARY_SENTINEL="__MISSING_BINARY__"
@@ -611,8 +613,24 @@ first_pass_collect() {
 
   local line stack_part count
   local frames idx frame binary key
+  local lines_seen=0
+  local log_step=$PROGRESS_LOG_EVERY
+
+  if [[ $DEBUG_MODE -eq 1 ]]; then
+    TOTAL_INPUT_LINES=$(wc -l < "$INPUT_PATH" 2>/dev/null || printf '0')
+    debug_log "first_pass_collect start: total_lines=$TOTAL_INPUT_LINES"
+  fi
 
   while IFS= read -r line || [[ -n "$line" ]]; do
+    ((++lines_seen))
+    if [[ $DEBUG_MODE -eq 1 && $log_step -gt 0 && $((lines_seen % log_step)) -eq 0 ]]; then
+      if [[ $TOTAL_INPUT_LINES -gt 0 ]]; then
+        debug_log "first_pass_collect progress: lines=${lines_seen}/${TOTAL_INPUT_LINES}"
+      else
+        debug_log "first_pass_collect progress: lines=$lines_seen"
+      fi
+    fi
+
     [[ -z "$line" ]] && continue
 
     if [[ "$line" =~ ^(.+[^[:space:]])[[:space:]]+([0-9]+)$ ]]; then
@@ -663,6 +681,14 @@ first_pass_collect() {
       fi
     done
   done <"$INPUT_PATH"
+
+  if [[ $DEBUG_MODE -eq 1 ]]; then
+    if [[ $TOTAL_INPUT_LINES -gt 0 ]]; then
+      debug_log "first_pass_collect done: lines=${lines_seen}/${TOTAL_INPUT_LINES} buckets=${#BUCKET_TOKENS[@]}"
+    else
+      debug_log "first_pass_collect done: lines=$lines_seen buckets=${#BUCKET_TOKENS[@]}"
+    fi
+  fi
 }
 
 symbolize_bucket_chunk() {
@@ -677,6 +703,13 @@ run_batch_symbolization() {
   local bin tokens_str rels_str
   local -a tokens=()
   local -a rels=()
+  local processed_batches=0
+  local total_batches=0
+  local log_step=$PROGRESS_LOG_EVERY
+
+  if [[ $DEBUG_MODE -eq 1 ]]; then
+    debug_log "run_batch_symbolization start"
+  fi
   for bin in "${!BUCKET_TOKENS[@]}"; do
     tokens_str="${BUCKET_TOKENS[$bin]}"
     rels_str="${BUCKET_RELS[$bin]}"
@@ -698,6 +731,10 @@ run_batch_symbolization() {
     fi
 
     local start=0 end=0
+    if [[ $log_step -gt 0 ]]; then
+      local per_bin_batches=$(( ((${#tokens[@]} + MAX_ADDRS_PER_CHUNK - 1) / MAX_ADDRS_PER_CHUNK) ))
+      total_batches=$((total_batches + per_bin_batches))
+    fi
     while (( start < ${#tokens[@]} )); do
       end=$(( start + MAX_ADDRS_PER_CHUNK ))
       if (( end > ${#tokens[@]} )); then
@@ -711,17 +748,43 @@ run_batch_symbolization() {
 
       symbolize_bucket_chunk "$bin" "${chunk_tokens[*]}" "${chunk_rels[*]}"
 
+      ((++processed_batches))
+      if [[ $DEBUG_MODE -eq 1 && $log_step -gt 0 && $((processed_batches % log_step)) -eq 0 ]]; then
+        if [[ $total_batches -gt 0 ]]; then
+          debug_log "run_batch_symbolization progress: batches=${processed_batches}/${total_batches}"
+        else
+          debug_log "run_batch_symbolization progress: batches=$processed_batches"
+        fi
+      fi
+
       start=$end
     done
   done
+
+  if [[ $DEBUG_MODE -eq 1 ]]; then
+    if [[ $total_batches -gt 0 ]]; then
+      debug_log "run_batch_symbolization done: batches=${processed_batches}/${total_batches}"
+    else
+      debug_log "run_batch_symbolization done: batches=$processed_batches"
+    fi
+  fi
 }
 
 # Second pass: emit output using cache (no additional addr2line calls)
 second_pass_emit() {
   local line stack_part count
   local frames idx token joined
+  local log_step=$PROGRESS_LOG_EVERY
   while IFS= read -r line || [[ -n "$line" ]]; do
     ((++LINES_PROCESSED))
+
+    if [[ $DEBUG_MODE -eq 1 && $log_step -gt 0 && $((LINES_PROCESSED % log_step)) -eq 0 ]]; then
+      if [[ $TOTAL_INPUT_LINES -gt 0 ]]; then
+        debug_log "second_pass_emit progress: lines=${LINES_PROCESSED}/${TOTAL_INPUT_LINES}"
+      else
+        debug_log "second_pass_emit progress: lines=$LINES_PROCESSED"
+      fi
+    fi
 
     if [[ -z "$line" ]]; then
       printf '\n'
@@ -750,6 +813,14 @@ second_pass_emit() {
     joined="${frames[*]}"
     printf '%s %s\n' "$joined" "$count"
   done <"$INPUT_PATH"
+
+  if [[ $DEBUG_MODE -eq 1 ]]; then
+    if [[ $TOTAL_INPUT_LINES -gt 0 ]]; then
+      debug_log "second_pass_emit done: lines=${LINES_PROCESSED}/${TOTAL_INPUT_LINES}"
+    else
+      debug_log "second_pass_emit done: lines=$LINES_PROCESSED"
+    fi
+  fi
 }
 
 # argument parsing
