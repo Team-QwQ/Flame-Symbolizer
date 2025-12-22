@@ -15,7 +15,6 @@
 	--symbol-dir /opt/sysroot \
 	--toolchain-prefix aarch64-linux-gnu- \
 	--addr2line-flags "-f -C" \
-	--location-format short \
 	--input collapsed.txt \
 	--output collapsed.resolved.txt
 ```
@@ -23,7 +22,7 @@
 
 ### 选项要点
 - `--toolchain-prefix`：交叉工具链前缀（如 `aarch64-linux-gnu-`），用于调用 `addr2line`、`readelf` 等；如需自定义 `addr2line` 路径，可再用 `--addr2line` 覆盖。
-- `--location-format`：符号输出格式；`short`（默认）仅保留文件名与行号，`full` 保留路径，`none` 去掉 file:line。
+- `--location-format`：符号输出格式；默认 `none`（仅函数名，避免 stackcollapse 因文件名差异拆分同一符号），`short` 增加文件名（无路径）与行号，`full` 保留路径。
 - `--debug`：打印段表、符号目录命中与地址调整决策到 stderr；输出文件不变。
 - ELF 类型自动识别：`ET_EXEC` 直接用运行时地址，`ET_DYN`（PIE/DSO）使用基址调整；无法识别时退化为相对地址。
 - 符号缺失告警：找不到模块二进制时对同一模块仅告警一次；符号缺失/`??` 时允许多次告警，但后续地址仍会继续尝试解析。
@@ -46,8 +45,8 @@ bash tests/run-fixture.sh
 若需在真实数据上测试，只需替换 `--maps` / `--symbol-dir` / `--input` 参数，并提供可执行的 `addr2line`。脚本会在无法找到匹配模块或符号时输出 `[WARN]`，但保持流水线继续执行。
 
 ## 辅助脚本
-- heaptrack 原始数据转 stackcollapse：`scripts/auxiliary/heaptrack-to-raw-stack.sh <heaptrack.raw.gz> [output_stack_file]`
-	- 依赖 `heaptrack_interpret`、`heaptrack_print`，默认输出 `stack.txt`。
-- 渲染泄漏火焰图：`scripts/auxiliary/render-leak-flamegraph.sh [stack_file] [output_svg]`
-	- 默认输入 `./stack.txt`、输出 `raw-leak.svg`，可用环境变量 `FLAMEGRAPH_BIN` 指定 `flamegraph.pl` 路径。
+- heaptrack 原始数据转 stackcollapse：`scripts/auxiliary/heaptrack-to-raw-stack.sh [--cost-type TYPE] <heaptrack.raw.gz> [output_stack_file]`
+	- 依赖 `heaptrack_interpret`、`heaptrack_print`，默认输出 `stack.txt`；`--cost-type` 支持 `leaked|allocations|temporary|peak`（默认 leaked，对应 heaptrack_print 的 `--flamegraph-cost-type`）。
+- 渲染泄漏火焰图：`scripts/auxiliary/render-leak-flamegraph.sh [--cost-type TYPE] [stack_file] [output_svg]`
+	- 默认输入 `./stack.txt`、输出 `raw-leak.svg`，可用环境变量 `FLAMEGRAPH_BIN` 指定 `flamegraph.pl` 路径；`--cost-type` 同上，并影响 flamegraph 标题与计数名（如 leaked→bytes，allocations→allocs）。
 - 两个脚本均支持 `-h/--help` 查看内置用法说明。

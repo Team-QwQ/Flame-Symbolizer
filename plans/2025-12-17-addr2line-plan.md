@@ -15,7 +15,7 @@
 
 ## 实施阶段与步骤
 1. **脚本骨架与参数解析**
-   - 扩展 `scripts/resolve-stacks.sh` 参数：必选 `--maps`，可选多次 `--symbol-dir`，`--toolchain-prefix`（调用 `addr2line`/`readelf` 等前缀），`--addr2line` 覆盖，`--addr2line-flags` 透传，`--input`/`--output`（均为文件路径，不支持 stdin/stdout），`--location-format`（none|short|full，默认 short），`--debug`。
+   - 扩展 `scripts/resolve-stacks.sh` 参数：必选 `--maps`，可选多次 `--symbol-dir`，`--toolchain-prefix`（调用 `addr2line`/`readelf` 等前缀），`--addr2line` 覆盖，`--addr2line-flags` 透传，`--input`/`--output`（均为文件路径，不支持 stdin/stdout），`--location-format`（none|short|full，默认 none），`--debug`。
    - 完善帮助与错误码，缺失必需参数、输入不可读、输出目录不存在、输入输出路径相同等场景立即退出。
 
 2. **基础管线实现（两阶段批处理）**
@@ -37,6 +37,7 @@
 
 5. **调试与可见性**
    - 默认 `[INFO]` 级输出进度与 summary：首遍行进度、唯一地址计数/桶构建进度、批处理进度/总批次、二遍行进度与最终计数（行数、批次数、模块命中/缺失、跳过计数）。
+   - `--location-format` 默认改为 `none`，避免因文件名差异导致已符号帧在 stackcollapse 阶段被拆分；可选 `short|full` 开启文件名/行号。
    - `--debug` 模式下输出段表、符号目录命中、地址调整决策到 stderr；输出文件不受影响。
    - 默认模式下：缺失二进制警告一次/模块；符号缺失/`??` 可多次警告，但后续地址仍会尝试解析。
 

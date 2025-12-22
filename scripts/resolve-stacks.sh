@@ -15,7 +15,7 @@ Optional:
   --toolchain-prefix STR      Prefix for cross toolchain (e.g. aarch64-linux-gnu-); applied to readelf/addr2line.
   --addr2line PATH            addr2line binary to invoke (default: value of $ADDR2LINE or 'addr2line').
   --addr2line-flags STRING    Extra flags passed verbatim to addr2line (e.g. "-f -C").
-  --location-format MODE      none|short|full; default short (function + basename + line; full keeps path; none hides file:line).
+  --location-format MODE      none|short|full; default none (functions only; short adds basename+line; full keeps path).
   --debug                     Enable verbose debug logging to stderr (segment table, symbol hits, adjustments).
   -h, --help                  Show this message and exit.
 EOF
@@ -67,7 +67,7 @@ ADDR2LINE_BIN="${ADDR2LINE:-addr2line}"
 ADDR2LINE_FLAGS=""
 TOOLCHAIN_PREFIX=""
 READ_ELF_BIN="readelf"
-LOCATION_FORMAT="short"
+LOCATION_FORMAT="none"
 DEBUG_MODE=0
 
 # Maximum number of addresses per addr2line call (chunked per binary to avoid argv limits)
