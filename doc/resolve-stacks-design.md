@@ -2,12 +2,13 @@
 
 ## 目的与范围
 - 面向 release 环境的火焰图符号化脚本，处理大规模 stackcollapse 文本，保持行序与计数。
-- 支持 maps 基址恢复、符号目录查找、ELF 类型判断、地址级批处理（默认开启），输入输出仅支持文件，不再支持 stdin/stdout 流式。
+- 支持多输入/多输出成对处理（顺序执行），跨输入共享符号化缓存以避免重复 addr2line 调用。
+- 支持 maps 基址恢复、符号目录查找、ELF 类型判断、地址级批处理（默认开启），输入输出仅支持文件，不再支持 stdin/stdout 流式，默认 location-format=short。
 
 ## 整体设计思想
 - **两阶段批处理（awk 辅助）**：首遍用 awk 解析行/帧，生成帧临时文件并收集唯一地址；二遍基于帧文件直接回填缓存，保持行序与计数，避免重复正则与 trim。空行直接透传。
-- **分层职责**：参数解析→符号目录解析→maps 载入→首遍收集/建桶→分块批量符号化→二遍回填输出。
-- **缓存优先**：地址、模块、二进制、ELF 类型、告警均缓存，减少重复 I/O 与外部命令；缺失二进制使用负缓存。
+- **分层职责**：参数解析→符号目录解析→maps 载入→首遍收集/建桶→分块批量符号化→二遍回填输出；多输入按顺序处理，复用同一缓存和目录解析结果。
+- **缓存优先**：地址、模块、二进制、ELF 类型、告警均缓存，减少重复 I/O 与外部命令；缺失二进制使用负缓存；跨输入共享 ADDRESS_CACHE 等缓存，命中时跳过分桶和 addr2line。
 - **批量优先**：同一二进制的地址分桶，分块调用 addr2line（默认每块最多 256 个地址）；必要时回退单地址解析。
 - **健壮性**：对缺符号、缺工具、负偏移、maps 未命中、批量输出不足等场景降级但不中断；支持省略/等于输入路径时的原地覆盖（临时文件 + fsync + mv）。
 - **可观测性**：`--debug` 输出段表、符号命中、决策、进度与批次计数；警告去重避免刷屏。
@@ -40,8 +41,8 @@ flowchart TD
 ## 数据存储结构
 - 数组（按 maps 段索引对齐）
   - `MAP_STARTS/ENDS/OFFSETS/PATHS/ADJUSTS`：段起止、偏移、路径、基址调整。
-- 关联数组（哈希）
-  - `ADDRESS_CACHE`：帧 token → 最终输出（含未解析时的原值）。
+- 关联数组（哈希，跨输入共享生命周期）
+  - `ADDRESS_CACHE`：帧 token → 最终输出（含未解析时的原值）；命中可跨输入复用。
   - `ADDRESS_META`：地址解析状态（READY/UNRESOLVABLE）。
   - `ADDRESS_SEGMENT`：地址 → 段索引。
   - `ADDRESS_BINARY`：地址 → 符号二进制路径。
@@ -50,19 +51,19 @@ flowchart TD
   - `BINARY_CACHE`：模块路径 → 符号二进制（或缺失哨兵）。
   - `MODULE_TYPES`：二进制路径 → ELF 类型（ET_EXEC/ET_DYN/UNKNOWN）。
   - `WARNED_ONCE`：告警去重键集。
-  - `BUCKET_TOKENS/BUCKET_RELS`：首遍按二进制收集去重后的地址与相对值。
-  - `TMP_FRAMES_FILE/TMP_ADDRS_FILE`：首遍 awk 生成的帧临时文件与唯一地址列表。
+  - `BUCKET_TOKENS/BUCKET_RELS`：首遍按二进制收集去重后的地址与相对值（仅当前输入有效）。
+  - `TMP_FRAMES_FILE/TMP_ADDRS_FILE`：首遍 awk 生成的帧临时文件与唯一地址列表（仅当前输入）。
 - 计数器
-  - `LINES_PROCESSED`：已处理行数。
-  - `BATCH_CALLS`：已发起的批量 addr2line 调用次数。
-  - `MODULE_RESOLVE_HITS/MISS`、`ADDR2LINE_SKIPPED`：模块命中/缺失、`??` 计数。
+  - `LINES_PROCESSED`：已处理行数（当前输入）。
+  - `BATCH_CALLS`：已发起的批量 addr2line 调用次数（当前输入）。
+  - `MODULE_RESOLVE_HITS/MISS`、`ADDR2LINE_SKIPPED`：模块命中/缺失、`??` 计数（累计跨输入）。
 
 ## 数据流与决策
-1. **输入**：仅文件；maps 文件必需；符号目录模式解析为绝对路径集合。
+1. **输入**：仅文件；支持多对 input/output，未提供 output 时默认原地覆盖；maps 文件必需；符号目录模式解析为绝对路径集合。
 2. **段命中**：地址十六进制转十进制命中 `MAP_STARTS/ENDS`，获得模块路径与调整值。
 3. **符号目录查找**：先目录根平铺按文件名尝试，再按 maps 原始绝对路径做 sysroot 拼接，最后按 basename 递归 `find` 首命中，结果缓存至 `BINARY_CACHE`（缺失写哨兵）。
 4. **ELF 类型与相对地址**：`detect_elf_type` 缓存类型；ET_EXEC 用运行时地址，ET_DYN/UNKNOWN 用 `addr - adjust`。
-5. **批量分桶**：首遍按二进制聚合去重 `ADDRESS_RELHEX`，每个二进制按块（默认 256 个地址）调用一次或多次 addr2line。
+5. **批量分桶**：首遍按二进制聚合去重 `ADDRESS_RELHEX`，每个二进制按块（默认 256 个地址）调用一次或多次 addr2line；若地址已命中 `ADDRESS_CACHE`（跨输入缓存），直接跳过分桶与符号化。
 6. **结果填充**：批量输出按 token 顺序写回 `ADDRESS_CACHE`；输出不足或失败时回退单地址符号化，失败/`??` 写回原地址并计数。
 7. **行输出（二遍 awk）**：读取帧临时文件，按缓存回填帧并重组行，保持原分隔与计数；空行/异常行在帧文件中已标记直接透传。
 
@@ -79,8 +80,7 @@ flowchart TD
 - 原因：部分路径解析流程在子 shell 中执行（如管道/`mapfile`），`WARNED_ONCE` 关联数组在子 shell 间不共享，导致内存去重失效；且若在入口早期调用 `warn_once` 时未先创建去重文件，会在 `set -e` 下直接退出。
 - 修正：脚本启动即创建去重临时文件并注册退出清理，`warn_once` 在主进程与子 shell 均写该文件；同时保留内存哈希，确保同一 key 只告警一次且早期告警不会因文件缺失而终止。
 
-## 可观测性
-- 默认 `[INFO]` 进度：首遍行数、唯一地址数/桶构建进度，批处理进度/总批次，二遍行进度与最终 summary（行数、批次数、模块命中/缺失、跳过计数），周期由 `PROGRESS_LOG_EVERY` 控制。
+- 默认 `[INFO]` 进度：首遍行数、唯一地址数/桶构建进度，批处理进度/总批次，二遍行进度与最终 summary（行数、批次数、模块命中/缺失、跳过计数），周期由 `PROGRESS_LOG_EVERY` 控制；多输入逐个输出阶段日志，最终 summary 跨输入聚合。
 - `--debug` 输出：
   - 符号目录解析结果。
   - maps 段表。
