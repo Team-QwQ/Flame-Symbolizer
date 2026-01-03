@@ -22,7 +22,7 @@
 
 ### 选项要点
 - `--toolchain-prefix`：交叉工具链前缀（如 `aarch64-linux-gnu-`），用于调用 `addr2line`、`readelf` 等；如需自定义 `addr2line` 路径，可再用 `--addr2line` 覆盖。
-- `--location-format`：符号输出格式；默认 `none`（仅函数名，避免 stackcollapse 因文件名差异拆分同一符号），`short` 增加文件名（无路径）与行号，`full` 保留路径。
+- `--location-format`：符号输出格式；默认 `short`（函数名+文件基名+行号）；如需避免因文件名差异拆分同一符号，可选 `none`；`full` 保留路径。
 - `--debug`：打印段表、符号目录命中与地址调整决策到 stderr；输出文件不变。
 - ELF 类型自动识别：`ET_EXEC` 直接用运行时地址，`ET_DYN`（PIE/DSO）使用基址调整；无法识别时退化为相对地址。
 - 符号缺失告警：找不到模块二进制时对同一模块仅告警一次；符号缺失/`??` 时允许多次告警，但后续地址仍会继续尝试解析。
@@ -46,7 +46,9 @@ bash tests/run-fixture.sh
 
 ## 辅助脚本
 - heaptrack 原始数据转 stackcollapse：`scripts/auxiliary/heaptrack-to-raw-stack.sh [--cost-type TYPE] <heaptrack.raw.gz> [output_stack_file]`
-	- 依赖 `heaptrack_interpret`、`heaptrack_print`，默认输出 `stack.txt`；`--cost-type` 支持 `leaked|allocations|temporary|peak`（默认 leaked，对应 heaptrack_print 的 `--flamegraph-cost-type`）。
+	- 默认输出 `stack.txt`；`--cost-type` 支持 `leaked|allocations|temporary|peak`（默认 leaked，对应 `heaptrack_print --flamegraph-cost-type`）。
+	- 运行时要求输入文件存在；依赖 `zcat`、`heaptrack_interpret`、`heaptrack_print`（脚本不预检可用性，缺失会在命令处失败）。
 - 渲染泄漏火焰图：`scripts/auxiliary/render-leak-flamegraph.sh [--cost-type TYPE] [stack_file] [output_svg]`
-	- 默认输入 `./stack.txt`、输出 `raw-leak.svg`，可用环境变量 `FLAMEGRAPH_BIN` 指定 `flamegraph.pl` 路径；`--cost-type` 同上，并影响 flamegraph 标题与计数名（如 leaked→bytes，allocations→allocs）。
-- 两个脚本均支持 `-h/--help` 查看内置用法说明。
+	- 默认输入 `./stack.txt`、输出 `raw-leak.svg`；`--cost-type` 同上，影响标题与计数名（如 leaked→bytes，allocations→allocs）。
+	- 校验 stack 文件存在与 `FLAMEGRAPH_BIN`（默认为 `flamegraph.pl`）可执行，其他依赖按命令失败处理。
+- 两个脚本均支持 `-h/--help` 查看内置用法说明，成功时在 stdout 打印生成文件路径与 cost-type。
