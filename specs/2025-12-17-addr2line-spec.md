@@ -19,8 +19,11 @@
 - 不处理非十六进制地址格式的符号解析。
 
 ## 输入/输出格式
-- **输入**：必须为可读文本文件（stackcollapse 格式），不再支持从 stdin 读取。
-- **输出**：必须为文件路径，生成的文本与输入行数一致；若地址解析成功，frame 被函数签名替代；解析失败则维持原 `0x...` 片段。默认不支持写 stdout。
+- **输入**：必须为可读文本文件（stackcollapse 格式），不再支持从 stdin 读取；允许提供多个 `--input`，默认假定它们来自同一进程实例、使用相同的 maps 与符号目录。
+- **输出**：必须为文件路径，生成的文本与输入行数一致；若地址解析成功，frame 被函数签名替代；解析失败则维持原 `0x...` 片段。默认不支持写 stdout。对多输入场景：
+   - 若未指定对应的 `--output`，默认逐个原地覆盖各输入文件。
+   - 若显式指定 `--output`，数量必须与 `--input` 等长（逐一对应），避免混淆。
+   - 多输入处理顺序：同一进程的多个输入文件可在同一运行中连续处理，已解析的符号与缓存可在后续输入间复用；每个输入文件完成后写入其对应输出路径（或原地覆盖）。
 - **覆盖模式**：若未指定 `--output` 或显式将 `--output` 设为与 `--input` 相同路径，则走“原地覆盖”流程：先写入同目录临时文件并 fsync，再使用同一文件系统内的原子 `mv` 覆盖输入文件；失败时保留原文件并报告临时文件位置。
 - 默认符号格式改为不包含文件名/行号（`none`），避免因相对/基名差异导致已符号帧在 stackcollapse 阶段被拆成多份；可通过 `--location-format short|full` 开启文件名与行号（短名或含路径）。
 - 行尾计数及分隔符保持不变；脚本尽量不改动已为符号的帧。
@@ -63,7 +66,8 @@
 ## 命令行设计草案
 ```
  resolve-stacks.sh \
-      --input stack.txt [--output stack.resolved.txt] \
+    --input stack.txt [--output stack.resolved.txt] \
+    [--input stack2.txt --output stack2.resolved.txt ...] \
          [--symbol-dir /opt/firmware/symbols/**] \
          --maps /tmp/proc-maps.txt \
          [--toolchain-prefix aarch64-linux-gnu-] \
