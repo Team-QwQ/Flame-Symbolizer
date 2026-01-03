@@ -15,26 +15,26 @@
 - 不在脚本内做符号化（仍由上游 `resolve-stacks.sh` 负责）。
 - 不引入 GUI/服务端，仅保留命令行脚本。
 
-## 功能需求
+## 功能需求（与当前实现对齐）
 - `heaptrack-to-raw-stack.sh`
   - 入参：`<heaptrack.raw.gz> [output_stack_file]`，默认输出 `stack.txt`。
   - 可选参数：`--cost-type {leaked|allocations|temporary|peak}`，默认 `leaked`，用于驱动 `heaptrack_print --flamegraph-cost-type <type>`。
-  - 行为：`heaptrack_interpret` + `heaptrack_print --flamegraph-cost-type <type> -F <out>`。
-  - 校验：输入文件存在；依赖 `heaptrack_interpret`、`heaptrack_print`、`zcat` 可用；临时文件清理。
-  - 帮助：`-h/--help` 输出用法与默认值。
+  - 行为：`zcat | heaptrack_interpret` 生成中间文件，再 `heaptrack_print --flamegraph-cost-type <type> -F` 输出栈文件；临时文件会清理。
+  - 校验：当前仅校验输入文件存在及 `--cost-type` 合法；不预检 `heaptrack_interpret`/`heaptrack_print`/`zcat` 可用性，缺失时依赖命令失败退出。
+  - 帮助：支持 `-h/--help` 输出用法与默认值。
 - `render-leak-flamegraph.sh`
   - 入参：`[stack_file] [output_svg]`，默认 `./stack.txt`、`raw-leak.svg`。
-  - 可选参数/环境：接受与 `heaptrack-to-raw-stack.sh` 相同的 `--cost-type`（默认 `leaked`），用于决定标题与计数名；允许显式覆盖标题/输出名（如有需要可通过参数或环境变量）。
-  - 行为：调用 `flamegraph.pl --colors=mem --title "<cost-type>" --countname=<metric>` 生成 SVG，其中 `<metric>` 与 cost-type 对应（例如 leaked→bytes，allocations→allocs，temporary/peak 可用 bytes 或合适的单位），标题应体现 cost-type。
-  - 校验：输入文件存在；`flamegraph.pl` 可用；可通过环境变量 `FLAMEGRAPH_BIN` 覆盖路径。
-  - 帮助：`-h/--help` 输出用法与默认值。
+  - 可选参数/环境：接受与 `heaptrack-to-raw-stack.sh` 相同的 `--cost-type`（默认 `leaked`），用于决定标题与计数名；允许 `FLAMEGRAPH_BIN` 覆盖 flamegraph.pl 路径。
+  - 行为：调用 `flamegraph.pl --colors=mem --title "<cost-type>" --countname=<metric>` 生成 SVG，其中 `<metric>` 与 cost-type 对应（例如 leaked→bytes，allocations→allocs，temporary/peak 使用 bytes）。
+  - 校验：校验 stack 文件存在与 `FLAMEGRAPH_BIN` 可执行；未预检其它依赖。
+  - 帮助：支持 `-h/--help` 输出用法与默认值。
 
 ## 约束与兼容性
-- 依赖 Bash、heaptrack 工具链、flamegraph.pl；要求可读输入、可写输出目录。
+- 依赖 Bash、heaptrack 工具链、flamegraph.pl；当前实现未对工具可用性做预检，运行时缺失将直接失败。
 - 默认输出文件若已存在，直接覆盖。
 
 ## 可观测性
-- 成功路径打印摘要（输出路径）；失败路径打印错误并以非零退出。
+- 成功路径打印摘要（输出路径与 cost-type）；失败路径依赖底层命令错误并以非零退出，未添加额外提示。
 
 ## 验收标准
 - 对合法输入，两个脚本均成功退出且产生预期输出文件。

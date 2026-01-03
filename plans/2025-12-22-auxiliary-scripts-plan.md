@@ -8,22 +8,21 @@
 - 环境具备 Bash、heaptrack 工具链、flamegraph.pl。
 - 不改动主符号化脚本 `resolve-stacks.sh`，仅围绕辅助脚本。
 
-## 计划步骤
-1) 补齐 CLI 帮助与默认值
-   - 为两个脚本实现 `-h/--help`，描述参数、默认值、依赖。
+## 计划步骤（与现状对齐）
+1) CLI 帮助与默认值
+   - 已实现：两个脚本均支持 `-h/--help`、cost-type 选项与默认值说明。
 2) 依赖与输入输出校验
-   - 检查必需工具存在；输入文件存在；输出目录可写；`mktemp` 失败兜底。
+   - 现状：仅校验输入文件存在（两脚本）和 `FLAMEGRAPH_BIN` 是否可执行；未预检 `heaptrack_interpret`/`heaptrack_print`/`zcat`，缺失时依赖命令失败退出。若需完善依赖预检，另行补充。
 3) 行为对齐规范
-   - `heaptrack-to-raw-stack.sh` 支持 `--cost-type {leaked|allocations|temporary|peak}`（默认 leaked），调用 `heaptrack_interpret` + `heaptrack_print --flamegraph-cost-type <type> -F`；临时文件清理。
-   - `render-leak-flamegraph.sh` 接受相同的 `--cost-type`，根据类型设置 `flamegraph.pl` 的标题与计数名（如 leaked→bytes，allocations→allocs，temporary/peak 选择合适的计数名）；支持 `FLAMEGRAPH_BIN` 覆盖。
+   - 已实现：`heaptrack-to-raw-stack.sh` 支持 `--cost-type`（默认 leaked），使用 `heaptrack_interpret` + `heaptrack_print --flamegraph-cost-type <type> -F`，并清理临时文件。
+   - 已实现：`render-leak-flamegraph.sh` 支持相同 `--cost-type`，根据类型设置标题/计数名，支持 `FLAMEGRAPH_BIN` 覆盖。
 4) 文档更新
-   - README 辅助脚本章节同步参数/默认值/依赖。
-   - 如有需要，在脚本内打印成功摘要。
+   - 待办：README 辅助脚本章节尚未同步参数/默认值/依赖；如需补充成功摘要或依赖说明，另行更新。
 
 ## 验证策略
-- 手动：针对示例 heaptrack.raw.gz（或空跑依赖检查）验证成功/失败路径；检查生成的 stack 文件与 SVG 存在且非空。
-- 帮助：运行 `-h/--help` 确认输出用法文本。
+- 已覆盖：`-h/--help` 输出用法文本；基础 happy path 可手动运行检查文件生成。
+- 未覆盖：依赖预检、README 同步后的文档验收（待后续补充）。
 
 ## 状态
-- 当前阶段：/plan
-- 下一步：按计划执行并更新文档。
+- 当前阶段：部分落实（脚本功能与帮助已具备），依赖预检与 README 同步尚未完成。
+- 如需补完依赖检查/文档，再行提交更新。
