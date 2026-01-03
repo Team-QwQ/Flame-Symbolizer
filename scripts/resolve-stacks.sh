@@ -6,8 +6,8 @@ print_help() {
 Usage: resolve-stacks.sh [options]
 
 Required:
-  --input FILE               Input file (stackcollapse format). Stdin is not supported.
-  --output FILE              Output file path. Stdout is not supported.
+  --input FILE               Input file (stackcollapse format). Repeatable; stdin is not supported.
+  --output FILE              Output file path. Repeatable; must match --input count if provided. Stdout is not supported.
   --maps PATH                 Path to /proc/<pid>/maps style file used to recover load addresses.
 
 Optional:
@@ -61,8 +61,8 @@ info_log() {
 
 MAPS_FILE=""
 SYMBOL_DIRS=()
-INPUT_PATH=""
-OUTPUT_PATH=""
+INPUT_PATHS=()
+OUTPUT_PATHS=()
 ADDR2LINE_BIN="${ADDR2LINE:-addr2line}"
 ADDR2LINE_FLAGS=""
 TOOLCHAIN_PREFIX=""
@@ -643,7 +643,7 @@ first_pass_collect() {
 
   local log_step=$PROGRESS_LOG_EVERY
   TOTAL_INPUT_LINES=$(wc -l < "$INPUT_PATH" 2>/dev/null || printf '0')
-  info_log "first_pass_collect start: total_lines=$TOTAL_INPUT_LINES"
+  info_log "first_pass_collect start: input=$INPUT_PATH total_lines=$TOTAL_INPUT_LINES"
 
   awk -v frames_out="$TMP_FRAMES_FILE" -v addrs_out="$TMP_ADDRS_FILE" -v log_step="$log_step" -v total_lines="$TOTAL_INPUT_LINES" '
     BEGIN { FS = ""; OFS = "\t" }
@@ -736,7 +736,7 @@ run_batch_symbolization() {
   local total_batches=0
   local log_step=$PROGRESS_LOG_EVERY
 
-  info_log "run_batch_symbolization start"
+  info_log "run_batch_symbolization start: input=$INPUT_PATH"
   for bin in "${!BUCKET_TOKENS[@]}"; do
     tokens_str="${BUCKET_TOKENS[$bin]}"
     rels_str="${BUCKET_RELS[$bin]}"
@@ -789,9 +789,9 @@ run_batch_symbolization() {
   done
 
   if [[ $total_batches -gt 0 ]]; then
-    info_log "run_batch_symbolization done: batches=${processed_batches}/${total_batches}"
+    info_log "run_batch_symbolization done: input=$INPUT_PATH batches=${processed_batches}/${total_batches}"
   else
-    info_log "run_batch_symbolization done: batches=$processed_batches"
+    info_log "run_batch_symbolization done: input=$INPUT_PATH batches=$processed_batches"
   fi
 }
 
@@ -844,7 +844,7 @@ second_pass_emit() {
     printf '%s %s\n' "$joined" "$count"
   done <"$TMP_FRAMES_FILE"
 
-  info_log "second_pass_emit done: lines=${LINES_PROCESSED}/${TOTAL_INPUT_LINES}"
+  info_log "second_pass_emit done: input=$INPUT_PATH lines=${LINES_PROCESSED}/${TOTAL_INPUT_LINES}"
 }
 
 # argument parsing
@@ -860,11 +860,11 @@ while (($#)); do
       ;;
     --input)
       shift || abort "--input requires a file path"
-      INPUT_PATH="$1"
+      INPUT_PATHS+=("$1")
       ;;
     --output)
       shift || abort "--output requires a file path"
-      OUTPUT_PATH="$1"
+      OUTPUT_PATHS+=("$1")
       ;;
     --addr2line)
       shift || abort "--addr2line requires a binary path"
@@ -919,34 +919,38 @@ fi
 [[ -n "$MAPS_FILE" ]] || abort "--maps is required"
 [[ -r "$MAPS_FILE" ]] || abort "Cannot read maps file: $MAPS_FILE"
 
-[[ -n "$INPUT_PATH" ]] || abort "--input is required"
-if [[ "$INPUT_PATH" == "-" ]]; then
-  abort "Stdin is not supported; provide --input FILE"
-fi
-[[ -r "$INPUT_PATH" ]] || abort "Cannot read input file: $INPUT_PATH"
-
-# Default to in-place overwrite when --output is omitted
-if [[ -z "$OUTPUT_PATH" ]]; then
-  OUTPUT_PATH="$INPUT_PATH"
-fi
-if [[ "$OUTPUT_PATH" == "-" ]]; then
-  abort "Stdout is not supported; provide --output FILE"
+if [[ ${#INPUT_PATHS[@]} -eq 0 ]]; then
+  abort "--input is required"
 fi
 
-OUTPUT_DIR=$(dirname "$OUTPUT_PATH")
-if [[ ! -d "$OUTPUT_DIR" ]]; then
-  abort "Output directory does not exist: $OUTPUT_DIR"
+if [[ ${#OUTPUT_PATHS[@]} -gt 0 && ${#OUTPUT_PATHS[@]} -ne ${#INPUT_PATHS[@]} ]]; then
+  abort "When provided, --output count must match --input count"
 fi
 
-abs_in=$(cd "$(dirname "$INPUT_PATH")" && pwd -P)/"$(basename "$INPUT_PATH")"
-abs_out=$(cd "$(dirname "$OUTPUT_PATH")" && pwd -P)/"$(basename "$OUTPUT_PATH")"
-if [[ "$abs_in" == "$abs_out" ]]; then
-  INPLACE_MODE=1
-  OUTPUT_TMP_FILE=$(mktemp -p "$OUTPUT_DIR" ".resolve-stacks.tmp.XXXXXX") || abort "Failed to create temporary output file in $OUTPUT_DIR"
-  OUTPUT_ACTUAL="$OUTPUT_TMP_FILE"
-else
-  OUTPUT_ACTUAL="$OUTPUT_PATH"
+# Fill missing outputs with corresponding input paths (in-place overwrite)
+if [[ ${#OUTPUT_PATHS[@]} -eq 0 ]]; then
+  for ip in "${INPUT_PATHS[@]}"; do
+    OUTPUT_PATHS+=("$ip")
+  done
 fi
+
+# Pre-validate inputs readable and outputs writable directories exist
+for ip in "${INPUT_PATHS[@]}"; do
+  if [[ "$ip" == "-" ]]; then
+    abort "Stdin is not supported; provide --input FILE"
+  fi
+  [[ -r "$ip" ]] || abort "Cannot read input file: $ip"
+done
+
+for op in "${OUTPUT_PATHS[@]}"; do
+  if [[ "$op" == "-" ]]; then
+    abort "Stdout is not supported; provide --output FILE"
+  fi
+  OUTPUT_DIR=$(dirname "$op")
+  if [[ ! -d "$OUTPUT_DIR" ]]; then
+    abort "Output directory does not exist: $OUTPUT_DIR"
+  fi
+done
 
 if ! command -v "$ADDR2LINE_BIN" >/dev/null 2>&1; then
   abort "addr2line binary not found: $ADDR2LINE_BIN"
@@ -963,9 +967,29 @@ else
 fi
 
 # Placeholder for future stages
-run_symbolization() {
-  resolve_symbol_dirs
-  load_maps
+process_one_input() {
+  local INPUT_PATH="$1"
+  local OUTPUT_PATH="$2"
+
+  INPLACE_MODE=0
+  OUTPUT_TMP_FILE=""
+  OUTPUT_ACTUAL=""
+  LINES_PROCESSED=0
+  BATCH_CALLS=0
+  TOTAL_INPUT_LINES=0
+
+  local OUTPUT_DIR=$(dirname "$OUTPUT_PATH")
+  abs_in=$(cd "$(dirname "$INPUT_PATH")" && pwd -P)/"$(basename "$INPUT_PATH")"
+  abs_out=$(cd "$(dirname "$OUTPUT_PATH")" && pwd -P)/"$(basename "$OUTPUT_PATH")"
+  if [[ "$abs_in" == "$abs_out" ]]; then
+    INPLACE_MODE=1
+    OUTPUT_TMP_FILE=$(mktemp -p "$OUTPUT_DIR" ".resolve-stacks.tmp.XXXXXX") || abort "Failed to create temporary output file in $OUTPUT_DIR"
+    OUTPUT_ACTUAL="$OUTPUT_TMP_FILE"
+  else
+    OUTPUT_ACTUAL="$OUTPUT_PATH"
+  fi
+
+  info_log "process start: input=$INPUT_PATH output=$OUTPUT_PATH"
 
   first_pass_collect
   run_batch_symbolization
@@ -991,7 +1015,20 @@ PY
     fi
   fi
 
-  info_log "summary lines=$LINES_PROCESSED batches=$BATCH_CALLS modules_hit=$MODULE_RESOLVE_HITS modules_miss=$MODULE_RESOLVE_MISS addr2line_skipped=$ADDR2LINE_SKIPPED"
+  info_log "process done: input=$INPUT_PATH output=$OUTPUT_PATH lines=$LINES_PROCESSED batches=$BATCH_CALLS"
+}
+run_symbolization() {
+  resolve_symbol_dirs
+  load_maps
+
+  local idx
+  for idx in "${!INPUT_PATHS[@]}"; do
+    INPUT_PATH="${INPUT_PATHS[$idx]}"
+    OUTPUT_PATH="${OUTPUT_PATHS[$idx]}"
+    process_one_input "$INPUT_PATH" "$OUTPUT_PATH"
+  done
+
+  info_log "summary modules_hit=$MODULE_RESOLVE_HITS modules_miss=$MODULE_RESOLVE_MISS addr2line_skipped=$ADDR2LINE_SKIPPED"
 }
 
 run_symbolization
