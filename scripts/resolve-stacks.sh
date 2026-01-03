@@ -99,7 +99,6 @@ declare -A MODULE_MISS_SEEN=()  # module path -> seen as miss
 
 declare -A BUCKET_TOKENS=()     # binary -> space-separated tokens (deduped)
 declare -A BUCKET_RELS=()       # binary -> space-separated rel addresses
-declare -A RAW_ADDR_SEEN=()     # raw address string -> seen flag for global dedup
 TMP_FRAMES_FILE=""
 TMP_ADDRS_FILE=""
 
@@ -636,7 +635,6 @@ symbolize_batch_for_binary() {
 first_pass_collect() {
   BUCKET_TOKENS=()
   BUCKET_RELS=()
-  RAW_ADDR_SEEN=()
 
   TMP_FRAMES_FILE=$(mktemp 2>/dev/null || printf '/tmp/resolve-stacks.frames.$$')
   TMP_ADDRS_FILE=$(mktemp 2>/dev/null || printf '/tmp/resolve-stacks.addrs.$$')
@@ -687,7 +685,18 @@ first_pass_collect() {
   info_log "first_pass_collect buckets: unique_addrs=$unique_addrs"
   while IFS= read -r addr || [[ -n "$addr" ]]; do
     ((++idx))
-    RAW_ADDR_SEEN["$addr"]=1
+
+    # 若全局缓存已有结果，跨输入复用，跳过分桶与 addr2line 调用
+    if [[ -n "${ADDRESS_CACHE[$addr]:-}" ]]; then
+      if [[ $log_step -gt 0 && $((idx % log_step)) -eq 0 ]]; then
+        if [[ $unique_addrs -gt 0 ]]; then
+          info_log "first_pass_collect buckets progress: addrs=${idx}/${unique_addrs} (cache-hit skip)"
+        else
+          info_log "first_pass_collect buckets progress: addrs=${idx} (cache-hit skip)"
+        fi
+      fi
+      continue
+    fi
 
     if ! prepare_address_metadata "$addr"; then
       ADDRESS_CACHE["$addr"]="$addr"
